@@ -1,0 +1,71 @@
+# Сборка и выпуск Lotus. Запускается тегом версии: git tag v1.0.5 && git push --tags
+# Собирает LotusSetup.exe и Lotus.exe, подписывает через SignPath (когда настроен) и выкладывает в релиз —
+# Lotus у пользователей находит новую версию по последнему релизу этого репозитория.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Версия в теге совпадает с version.py
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $v = python -c "from version import VERSION; print(VERSION)"
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "Тег ${{ github.ref_name }} не совпадает с version.py ($v)" }
+
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          choco install innosetup -y --no-progress
+
+      - name: Сборка
+        run: python build.py
+
+      - uses: actions/upload-artifact@v4
+        id: unsigned
+        with:
+          name: lotus-unsigned
+          path: |
+            dist/LotusSetup.exe
+            dist/Lotus.exe
+
+      # Подпись кода через SignPath (бесплатно для open source). Включается, когда в настройках
+      # репозитория заданы переменные SIGNPATH_ORGANIZATION_ID / SIGNPATH_PROJECT_SLUG /
+      # SIGNPATH_POLICY_SLUG и секрет SIGNPATH_API_TOKEN. До этого релиз выходит без подписи.
+      - name: Подпись (SignPath)
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist
+
+      - name: Релиз
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/LotusSetup.exe
+            dist/Lotus.exe
+            release/README.txt
+            release/README_EN.txt

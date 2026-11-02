@@ -1,0 +1,7 @@
+customtkinter==5.2.2
+pillow>=11
+pystray==0.19.5
+cryptography==46.0.5
+httpx[http2]==0.28.1
+certifi
+pyinstaller>=6.11

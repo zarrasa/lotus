@@ -1,0 +1,15 @@
+# сборки
+dist/
+dist_test/
+build/
+build_test/
+*.spec
+build*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# настройки и логи запуска из исходников
+config.json
+*.log
