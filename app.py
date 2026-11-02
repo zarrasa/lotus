@@ -769,7 +769,8 @@ class Settings(ctk.CTkToplevel):
 
         # пресет
         section(tr("set.preset"))
-        self.names = {tr(f"preset.{p.id}"): p.id for p in PRESETS}
+        # в раскрытом списке — название и когда его выбирать; в закрытом — только название
+        self.names = {f"{tr(f'preset.{p.id}')}  ·  {tr(f'phint.{p.id}')}": p.id for p in PRESETS}
         self.preset = ctk.CTkOptionMenu(body, values=list(self.names), height=34, corner_radius=10,
                                         command=self.on_preset, fg_color=R.T.field_bg,
                                         button_color=R.T.border, button_hover_color=R.T.accent_hex,
@@ -856,7 +857,8 @@ class Settings(ctk.CTkToplevel):
         a.cfg["preset"] = self.names[name]
         a.cfg["overrides"] = {}
         engine.save_config(a.cfg)
-        a.log(tr("msg.preset", name=name))
+        self.preset.set(tr(f"preset.{a.cfg['preset']}"))
+        a.log(tr("msg.preset", name=tr(f"preset.{a.cfg['preset']}")))
         if a.selected():
             a.apply()
         a.post(a._reopen_settings)
