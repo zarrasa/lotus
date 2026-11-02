@@ -14,6 +14,7 @@ from version import VERSION
 
 HERE = Path(__file__).parent
 test = "--test" in sys.argv
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # консоль может быть не в UTF-8
 
 COMMON = [
     sys.executable, "-m", "PyInstaller", "--noconfirm", "--windowed",
