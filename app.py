@@ -89,6 +89,7 @@ class App(ctk.CTk):
         self.dirty = False                   # выбор поменялся, нужно применить
         self.results: dict[str, bool] = {}   # итог проверки доступа по сервисам
         self.reasons: dict[str, str] = {}    # что именно не работает: st.fail / st.video_fail / ...
+        self.quic_hint_shown = False
         self.log_lines: list[str] = []
         self.settings: Settings | None = None
         self.ui_q: queue.Queue = queue.Queue()  # задачи для окна из фоновых потоков
@@ -375,7 +376,9 @@ class App(ctk.CTk):
     def log(self, text: str) -> None:
         def do():
             self.log_lines.append(text)
-            self.canvas.itemconfigure(self.msg, text=text)
+            # внизу окна места на 2-3 строки; длинное целиком остаётся в журнале в ⚙
+            short = text if len(text) <= 110 else text[:100].rsplit(" ", 1)[0] + "… " + tr("msg.more")
+            self.canvas.itemconfigure(self.msg, text=short)
             if self.settings and self.settings.winfo_exists():
                 self.settings.append_log(text)
         self.post(do)
@@ -436,6 +439,9 @@ class App(ctk.CTk):
         self.set_results(engine.check_details(self.selected()))
         bad = [svc_name(s) for s, ok in self.results.items() if not ok]
         self.log(tr("msg.fail", names=", ".join(bad)) if bad else tr("msg.all_ok"))
+        if self.results.get("youtube") is False and not self.quic_hint_shown:
+            self.quic_hint_shown = True   # почему браузер открывает, а Lotus пишет «нет» — раз за запуск
+            self.log(tr("msg.quic_hint"))
 
     def apply(self) -> None:
         """Применить текущий выбор плиток. Клики во время применения не теряются:
@@ -730,11 +736,15 @@ class Settings(ctk.CTkToplevel):
                                         dropdown_text_color=R.T.text, dropdown_hover_color=R.T.border)
         self.preset.set(tr(f"preset.{app.cfg['preset']}"))
         self.preset.pack(fill="x", padx=14)
+        ctk.CTkLabel(body, text=tr(f"pdesc.{app.cfg['preset']}"), text_color=R.T.text_off,
+                     font=ctk.CTkFont(size=11), wraplength=290, justify="left").pack(anchor="w", padx=14, pady=(4, 0))
         if app.cfg.get("overrides"):
             extra = ", ".join(f"{svc_name(s)} — {tr(f'preset.{p}')}" for s, p in app.cfg["overrides"].items())
             ctk.CTkLabel(body, text=tr("set.overrides", list=extra), text_color=R.T.muted,
                          font=ctk.CTkFont(size=11), wraplength=290, justify="left").pack(anchor="w", padx=14, pady=(4, 0))
         button(body, tr("set.auto"), self.on_auto).pack(fill="x", padx=14, pady=(6, 0))
+        ctk.CTkLabel(body, text=tr("pdesc.auto"), text_color=R.T.muted, font=ctk.CTkFont(size=11),
+                     wraplength=290, justify="left").pack(anchor="w", padx=14, pady=(4, 0))
 
         # инструменты
         section(tr("set.tools"))

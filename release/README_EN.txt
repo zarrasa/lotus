@@ -51,6 +51,18 @@ Games don't connect — ⚙ → "Update game IPs". Steam doesn't open — close 
 bypass tools (GoodbyeDPI, zapret, VPN). Include the log from ⚙ when asking for help.
 
 
+PRESETS
+-------
+A preset is a way to fool the ISP filter; different ISPs need different ones.
+Easiest: ⚙ → "Pick automatically" — Lotus tries all 10 and picks a working one per
+service. Each preset's description is shown under the list in ⚙.
+
+Why does Lotus say "blocked" while YouTube opens in the browser? Browsers use QUIC
+for YouTube, a separate path that works on any preset. Lotus checks the regular
+connection used by apps, TVs and browsers when QUIC is unavailable — prefer a preset
+where it says "works".
+
+
 TRAY AND AUTOSTART
 ------------------
 The X button hides Lotus next to the clock — it keeps working. Right-click the
