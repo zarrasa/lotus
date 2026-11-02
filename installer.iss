@@ -43,6 +43,8 @@ Name: "{autodesktop}\Lotus"; Filename: "{app}\Lotus.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\Lotus.exe"; Description: "{cm:LaunchProgram,Lotus}"; Flags: nowait postinstall skipifsilent shellexec
+; автообновление ставит молча (/VERYSILENT) — после него запустить новую версию в трей
+Filename: "{app}\Lotus.exe"; Parameters: "--updated"; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 ; остановить Lotus и его движки, убрать автозапуск

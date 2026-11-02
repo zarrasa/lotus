@@ -40,7 +40,8 @@ PILL = (210, 17, 86, 24)
 FRAME_MS = 16          # ~60 кадров в секунду
 SPIN_PERIOD = 1.1      # секунд на круг бегущего огонька
 WATCH_SEC = 300        # сторож проверяет доступ раз в 5 минут
-UPDATE_SEC = 24 * 3600 # обновления — раз в сутки
+UPDATE_SEC = 24 * 3600 # zapret и списки — раз в сутки
+LOTUS_SEC = 3600       # новая версия Lotus — раз в час (лимит GitHub без входа: 60 запросов в час)
 
 
 def _ease_out(t: float) -> float:
@@ -66,7 +67,7 @@ def fade_frames(start: float, n: int = 14) -> list[float]:
 
 
 class App(ctk.CTk):
-    def __init__(self, start_hidden: bool = False, show_event=None) -> None:
+    def __init__(self, start_hidden: bool = False, show_event=None, updated: bool = False) -> None:
         cfg = engine.load_config()
         i18n.set_lang(cfg.get("lang", "ru"))
         R.set_theme(THEMES_BY_ID.get(cfg.get("theme"), NIGHT))
@@ -90,6 +91,7 @@ class App(ctk.CTk):
         self.results: dict[str, bool] = {}   # итог проверки доступа по сервисам
         self.reasons: dict[str, str] = {}    # что именно не работает: st.fail / st.video_fail / ...
         self.quic_hint_shown = False
+        self.installing = False              # идёт установка новой версии Lotus
         self.log_lines: list[str] = []
         self.settings: Settings | None = None
         self.ui_q: queue.Queue = queue.Queue()  # задачи для окна из фоновых потоков
@@ -168,6 +170,10 @@ class App(ctk.CTk):
             self.apply()
         self.after(WATCH_SEC * 1000, self._watch)
         self.after(15_000, lambda: self.check_updates(quiet=True))
+        self.after(20_000, self._lotus_check)
+        if updated:   # перезапуск после автообновления
+            self.after(1500, lambda: (self.log(tr("msg.updated", v=VERSION)),
+                                      self.notify(tr("tray.updated_title"), tr("msg.updated", v=VERSION))))
 
     # --- оформление ---
 
@@ -557,20 +563,18 @@ class App(ctk.CTk):
                     count_ipset.cache = None
                     self.log(tr("msg.ipset", n=n))
                 z = updater.check_zapret()
-                l = updater.check_lotus()
+                l = None if quiet else updater.check_lotus()   # сам Lotus проверяется раз в час
             except Exception as e:
                 if not quiet:
                     self.log(tr("msg.upd_err", e=e))
                 return
-            self.updates = {"lotus": l, "zapret": z}
-            if l:
-                self.log(tr("msg.upd_lotus", v=l[0]))
+            self.updates["zapret"] = z
             if z:
                 self.log(tr("msg.upd_zapret", v=z))
-            if l or z:
-                self.notify(tr("tray.update_title"),
-                            tr("msg.upd_lotus", v=l[0]) if l else tr("msg.upd_zapret", v=z))
-            elif not quiet:
+                self.notify(tr("tray.update_title"), tr("msg.upd_zapret", v=z))
+            if l:
+                self.post(lambda: self._on_lotus_update(l))
+            elif not z and not quiet:
                 self.log(tr("msg.upd_none", v=VERSION, z=updater.zapret_version()))
             self.post(self._reopen_settings)
         threading.Thread(target=go, daemon=True).start()
@@ -590,14 +594,51 @@ class App(ctk.CTk):
             self.post(self._reopen_settings)
         self.run_bg(go)
 
-    def install_lotus_update(self) -> None:
-        info = self.updates.get("lotus")
-        if not info:
+    def _lotus_check(self) -> None:
+        """Раз в час: нет ли новой версии Lotus на GitHub."""
+        self.after(LOTUS_SEC * 1000, self._lotus_check)
+
+        def go():
+            try:
+                info = updater.check_lotus()
+            except Exception:
+                return   # нет сети или GitHub недоступен — попробуем через час
+            if info:
+                self.post(lambda: self._on_lotus_update(info))
+        threading.Thread(target=go, daemon=True).start()
+
+    def _on_lotus_update(self, info: tuple) -> None:
+        self.updates["lotus"] = info
+        if self.installing:
             return
+        if self.cfg.get("auto_update", True) and updater.is_installed():
+            if self.busy:   # идёт включение/подбор — поставим чуть позже
+                self.after(60_000, lambda: self._on_lotus_update(info))
+                return
+            self.log(tr("msg.upd_auto", v=info[0]))
+            self.notify(tr("tray.update_title"), tr("msg.upd_auto", v=info[0]))
+            self.install_lotus_update(silent=True)
+            return
+        if self.cfg.get("notified_version") != info[0]:   # о каждой версии напоминаем один раз
+            self.cfg["notified_version"] = info[0]
+            engine.save_config(self.cfg)
+            self.log(tr("msg.upd_lotus", v=info[0]))
+            self.notify(tr("tray.update_title"), tr("msg.upd_lotus", v=info[0]))
+        self._reopen_settings()
+
+    def install_lotus_update(self, silent: bool = False) -> None:
+        info = self.updates.get("lotus")
+        if not info or self.installing:
+            return
+        self.installing = True   # следующая ежечасная проверка не должна запустить установку ещё раз
 
         def go():
             self.log(tr("msg.upd_downloading"))
-            updater.install_lotus(info[1], info[2])
+            try:
+                updater.install_lotus(info[1], info[2], silent=silent)
+            except Exception:
+                self.installing = False   # не вышло — попробуем при следующей проверке
+                raise
             self.post(self.quit_app)   # установщик заменит файлы и запустит новую версию
         self.run_bg(go)
 
@@ -769,6 +810,9 @@ class Settings(ctk.CTkToplevel):
         self.watch = switch(tr("set.watch"), app.cfg.get("watchdog", True), self.on_watch)
         self.autostart = switch(tr("set.autostart"), app.autostart_on,
                                 lambda: app.set_autostart(bool(self.autostart.get())))
+        if updater.is_installed():   # портативный Lotus.exe сам не обновляется — только сообщает
+            self.auto_update = switch(tr("set.auto_update"), app.cfg.get("auto_update", True),
+                                      self.on_auto_update)
 
         # обновления
         section(tr("set.updates"))
@@ -797,6 +841,10 @@ class Settings(ctk.CTkToplevel):
     def append_log(self, text: str) -> None:
         self.logbox.insert("end", text + "\n")
         self.logbox.see("end")
+
+    def on_auto_update(self) -> None:
+        self.app.cfg["auto_update"] = bool(self.auto_update.get())
+        engine.save_config(self.app.cfg)
 
     def on_watch(self) -> None:
         self.app.cfg["watchdog"] = bool(self.watch.get())
@@ -914,4 +962,5 @@ if __name__ == "__main__":
         show.signal()   # Lotus уже в трее — просто показать его окно
         sys.exit(0)
     engine.install_runtime()
-    App(start_hidden="--tray" in sys.argv, show_event=show).mainloop()
+    updated = "--updated" in sys.argv   # запущен установщиком после автообновления
+    App(start_hidden="--tray" in sys.argv or updated, show_event=show, updated=updated).mainloop()

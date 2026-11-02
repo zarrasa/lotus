@@ -5,6 +5,8 @@ import io
 import json
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -121,13 +123,26 @@ def check_lotus() -> tuple[str, str, str | None] | None:
     return None
 
 
-def install_lotus(url: str, digest: str | None) -> None:
-    """Скачать установщик новой версии и запустить его; Lotus после этого нужно закрыть."""
+def is_installed() -> bool:
+    """Установлен через LotusSetup.exe (распакованная папка) — а не портативный Lotus.exe.
+    Сам обновляться умеет только установленный: портативному ставить новую версию некуда."""
+    return engine.FROZEN and (Path(sys.executable).parent / "_internal").is_dir()
+
+
+def install_lotus(url: str, digest: str | None, silent: bool = False) -> None:
+    """Скачать установщик новой версии и запустить его; Lotus после этого нужно закрыть.
+    silent — без окон (автообновление): установщик сам закроет Lotus и запустит новую версию."""
     if not url.startswith(f"https://github.com/{UPDATE_REPO}/releases/download/"):
         raise RuntimeError("неожиданный адрес обновления")
+    if silent and not digest:
+        raise RuntimeError("у релиза нет контрольной суммы — тихо ставить не буду")
     data = _get(url, timeout=600)
     if digest and hashlib.sha256(data).hexdigest() != digest.lower():
         raise RuntimeError("контрольная сумма обновления не совпала")
     path = Path(tempfile.gettempdir()) / "LotusSetup.exe"
     path.write_bytes(data)
-    os.startfile(str(path))
+    if silent:
+        subprocess.Popen([str(path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+                         creationflags=subprocess.DETACHED_PROCESS | engine.NO_WINDOW)
+    else:
+        os.startfile(str(path))
