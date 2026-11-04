@@ -371,14 +371,13 @@ class App(ctk.CTk):
             self.on_tile(k)
 
     def preset_menu(self, x: int, y: int) -> None:
-        """Список пресетов для YouTube и Discord: название, когда выбирать, и автоподбор."""
-        cur = self.tile_preset(PRESET_TILE)
+        """Стратегии Flowseal для YouTube и Discord (general, ALT, ALT2…) и автоподбор."""
+        cur = self.strategy()
         menu = tk.Menu(self, tearoff=0, bg=R.T.field_bg, fg=R.T.text, activebackground=R.T.accent_hex,
                        activeforeground="#FFFFFF", bd=0, font=("Segoe UI", 10))
-        for p in PRESETS:
-            mark = "✓  " if p.id == cur else "     "
-            menu.add_command(label=f"{mark}{tr(f'preset.{p.id}')}  ·  {tr(f'phint.{p.id}')}",
-                             command=lambda pid=p.id: self.set_tile_preset(PRESET_TILE, pid))
+        for name in engine.strategy_names():
+            mark = "✓  " if name == cur else "     "
+            menu.add_command(label=mark + name, command=lambda n=name: self.set_strategy(n))
         menu.add_separator()
         menu.add_command(label="     " + tr("set.auto"), command=lambda: self.run_bg(self.run_autodetect))
         try:
@@ -386,26 +385,19 @@ class App(ctk.CTk):
         finally:
             menu.grab_release()
 
-    def tile_preset(self, tid: str) -> str | None:
-        """Пресет сервисов плитки; None — если у них разные (подобраны по отдельности)."""
-        ov = self.cfg.get("overrides", {})
-        presets = {ov.get(s, self.cfg["preset"]) for s in tile_services(tid)}
-        return presets.pop() if len(presets) == 1 else None
+    def strategy(self) -> str:
+        """Стратегия Flowseal у плитки YouTube + Discord (по умолчанию — general)."""
+        names = engine.strategy_names()
+        cur = self.cfg.get("strategy")
+        return cur if cur in names else (names[0] if names else "")
 
-    def set_tile_preset(self, tid: str, pid: str) -> None:
-        """Пресет только для сервисов этой плитки — остальные не трогаем."""
-        ov = self.cfg.setdefault("overrides", {})
-        for s in tile_services(tid):
-            if pid == self.cfg["preset"]:
-                ov.pop(s, None)   # совпадает с общим — отдельный не нужен
-            else:
-                ov[s] = pid
+    def set_strategy(self, name: str) -> None:
+        self.cfg["strategy"] = name
         engine.save_config(self.cfg)
-        self.log(tr("msg.tile_preset", tile=tile_name(tid), name=tr(f"preset.{pid}")))
-        if any(s in self.selected() for s in tile_services(tid)):
+        self.log(tr("msg.tile_preset", tile=tile_name(PRESET_TILE), name=name))
+        if any(s in self.selected() for s in tile_services(PRESET_TILE)):
             self.apply()
         self.refresh()
-        self._reopen_settings()
 
     def _set_hover(self, sid: str | None) -> None:
         if sid != self.hover:
@@ -488,28 +480,36 @@ class App(ctk.CTk):
 
     def start_engine(self, preset_id: str | None = None) -> None:
         self.engine.start(self.selected(), preset_id or self.cfg["preset"], self.cfg["tg_secret"],
-                          self.cfg.get("overrides"))
+                          self.cfg.get("overrides"), self.strategy())
 
     def run_autodetect(self) -> bool:
-        """Подобрать пресеты (свой у сервиса, если общий ему не подходит) и включить выбранное.
+        """Подобрать: для YouTube + Discord — стратегию Flowseal, для остальных сервисов — пресеты
+        (свой у сервиса, если общий ему не подходит). Потом включить выбранное.
         True — если хоть что-то подошло."""
         self.results = {}
-        found = engine.autodetect(self.engine, self.selected(), self.log)
+        sel = self.selected()
+        found_any = False
+        if any(s in sel for s in engine.FLOWSEAL_SERVICES):
+            name = engine.autodetect_strategy(self.engine, sel, self.cfg["preset"], self.log)
+            if name:
+                self.cfg["strategy"] = name
+                found_any = True
+        found = engine.autodetect(self.engine, sel, self.log, exclude=engine.FLOWSEAL_SERVICES)
         if found:
             self.cfg["preset"], self.cfg["overrides"] = found
-            engine.save_config(self.cfg)
-            self.log(tr("msg.best", name=self.preset_summary()))
-        else:
-            self.log(tr("msg.none_helped"))
+            found_any = True
+        engine.save_config(self.cfg)
+        self.log(tr("msg.best", name=self.preset_summary()) if found_any else tr("msg.none_helped"))
         self.dirty = True  # autodetect всё остановил — вернуть выбранные сервисы
         self._apply_loop()
-        return bool(found)
+        return found_any
 
     def preset_summary(self) -> str:
-        """«Основной» или «Основной; Discord — Фейковый TLS»."""
-        main = tr(f"preset.{self.cfg['preset']}")
-        extra = [f"{svc_name(s)} — {tr(f'preset.{p}')}" for s, p in self.cfg.get("overrides", {}).items()]
-        return "; ".join([main, *extra])
+        """«YouTube + Discord — general (ALT); остальные — Основной; Twitch — Фейковый TLS»."""
+        parts = [f"{tile_name(PRESET_TILE)} — {self.strategy()}", tr("msg.others", name=tr(f"preset.{self.cfg['preset']}"))]
+        parts += [f"{svc_name(s)} — {tr(f'preset.{p}')}" for s, p in self.cfg.get("overrides", {}).items()
+                  if s not in engine.FLOWSEAL_SERVICES]
+        return "; ".join(parts)
 
     def set_results(self, details: dict) -> None:
         """Итог engine.check_details: открывается ли сервис и если нет — что именно."""
@@ -588,8 +588,7 @@ class App(ctk.CTk):
                 if not on:
                     self.spin.pop(sid, None)
                     self.anim[sid] = fade_frames(max(self.glow[sid], 0.6))
-        p = self.tile_preset(PRESET_TILE)
-        self.canvas.itemconfigure(self.arrow, text=(tr(f"preset.{p}") if p else tr("st.two_presets")) + "  ▼",
+        self.canvas.itemconfigure(self.arrow, text=self.strategy() + "  ▼",
                                   fill=R.T.text if self.tile_on(PRESET_TILE) else R.T.text_off)
         self._draw_pill(running)
         if hasattr(self, "tray"):
@@ -875,8 +874,9 @@ class Settings(ctk.CTkToplevel):
         self.preset.pack(fill="x", padx=14)
         ctk.CTkLabel(body, text=tr(f"pdesc.{app.cfg['preset']}"), text_color=R.T.text_off,
                      font=ctk.CTkFont(size=11), wraplength=290, justify="left").pack(anchor="w", padx=14, pady=(4, 0))
-        if app.cfg.get("overrides"):
-            extra = ", ".join(f"{svc_name(s)} — {tr(f'preset.{p}')}" for s, p in app.cfg["overrides"].items())
+        own = {s: p for s, p in app.cfg.get("overrides", {}).items() if s not in engine.FLOWSEAL_SERVICES}
+        if own:
+            extra = ", ".join(f"{svc_name(s)} — {tr(f'preset.{p}')}" for s, p in own.items())
             ctk.CTkLabel(body, text=tr("set.overrides", list=extra), text_color=R.T.muted,
                          font=ctk.CTkFont(size=11), wraplength=290, justify="left").pack(anchor="w", padx=14, pady=(4, 0))
         button(body, tr("set.auto"), self.on_auto).pack(fill="x", padx=14, pady=(6, 0))

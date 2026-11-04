@@ -20,6 +20,7 @@ COMMON = [
     sys.executable, "-m", "PyInstaller", "--noconfirm", "--windowed",
     "--name", "Lotus", "--icon", "icons/lotus.ico",
     "--add-data", "bin;bin", "--add-data", "lists;lists", "--add-data", "icons;icons",
+    "--add-data", "flowseal;flowseal",   # стратегии Flowseal для YouTube + Discord
     # tg-ws-proxy: импортируется только в режиме --tgproxy, поэтому собираем явно
     "--paths", "tgproxy", "--collect-submodules", "proxy", "--hidden-import", "utils.logging_setup",
     "--collect-data", "customtkinter",

@@ -23,8 +23,9 @@ Click a service tile — it gets unblocked right away. Click again to turn it of
 While a service is starting, a light runs around the tile. When the whole frame
 glows and the tile says "works" — you're done.
 
-• YouTube and Discord share one tile. The preset is shown on its right with an arrow ▼:
-  click it to pick another bypass method or pick one automatically.
+• YouTube and Discord share one tile. The strategy is shown on its right with an arrow ▼:
+  click it to pick another one — general, ALT, ALT2 … SIMPLE FAKE (strategies from
+  Flowseal's well-known build) — or "Pick automatically".
 • Instagram means Instagram, Facebook and Threads together.
 • Custom sites — open ⚙, type any sites (one per line), click "Save sites"
   and turn on the "Custom sites" tile.

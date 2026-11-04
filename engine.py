@@ -28,6 +28,8 @@ LOG = DATA / "winws.log"
 TG_DIR = ROOT / "tgproxy"
 TG_LOG = DATA / "tgproxy.log"
 TG_PORT = 1443
+FLOWSEAL = ROOT / "flowseal"   # стратегии Flowseal для YouTube + Discord (tools/import_flowseal.py)
+FLOWSEAL_SERVICES = ("youtube", "discord")
 GDPI_DIR = BIN / "gdpi"
 GDPI_LOG = DATA / "goodbyedpi.log"
 # DNS-запросы уходят на Яндекс DNS через нестандартный порт 1253 — провайдер их не подменяет
@@ -118,17 +120,52 @@ def relaunch_as_admin() -> None:
     sys.exit(0)
 
 
+# ---------- стратегии Flowseal ----------
+
+_flowseal_cache: dict | None = None
+
+
+def flowseal() -> dict:
+    """{"version": ..., "strategies": [{"name": "general (ALT)", "profiles": [[...], ...]}, ...]}"""
+    global _flowseal_cache
+    if _flowseal_cache is None:
+        try:
+            _flowseal_cache = json.loads((FLOWSEAL / "strategies.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _flowseal_cache = {"version": "?", "strategies": []}
+    return _flowseal_cache
+
+
+def strategy_names() -> list[str]:
+    return [s["name"] for s in flowseal()["strategies"]]
+
+
+def strategy_profiles(name: str) -> list[list[str]]:
+    lists, fake = str(FLOWSEAL / "lists") + "\\", str(FLOWSEAL / "fake") + "\\"
+    for s in flowseal()["strategies"]:
+        if s["name"] == name:
+            return [[t.replace("{FS_LISTS}/", lists).replace("{FS_FAKE}/", fake) for t in p]
+                    for p in s["profiles"]]
+    return []
+
+
 # ---------- сборка команды ----------
 
 def _sub(args: list[str]) -> list[str]:
     return [a.replace("{FAKE}/", str(FAKE) + "\\") for a in args]
 
 
-def build_args(service_ids: list[str], preset: Preset, overrides: dict[str, str] | None = None) -> list[str]:
+def build_args(service_ids: list[str], preset: Preset, overrides: dict[str, str] | None = None,
+               strategy: str | None = None) -> list[str]:
     """Команда winws. У каждого сервиса может быть свой пресет (overrides: id -> id пресета):
-    у одного провайдера YouTube и Discord часто режутся по-разному, и одного пресета на всех мало."""
+    у одного провайдера YouTube и Discord часто режутся по-разному, и одного пресета на всех мало.
+    strategy — стратегия Flowseal для YouTube и Discord: её профили идут первыми и заменяют
+    наши правила для этих двух сервисов (включая голос Discord)."""
     overrides = overrides or {}
     pick = lambda sid: PRESETS_BY_ID.get(overrides.get(sid), preset)
+    fs_profiles = strategy_profiles(strategy) if strategy and any(s in FLOWSEAL_SERVICES for s in service_ids) else []
+    if fs_profiles:
+        service_ids = [s for s in service_ids if s not in FLOWSEAL_SERVICES]
     services = [SERVICES_BY_ID[s] for s in service_ids if s in SERVICES_BY_ID]
     groups: dict[str, list[str]] = {}   # id пресета -> hostlist'ы сервисов с этим пресетом
     for s in services:
@@ -145,8 +182,15 @@ def build_args(service_ids: list[str], preset: Preset, overrides: dict[str, str]
         wf_tcp.append(GAME_PORTS)
         wf_udp.append(GAME_PORTS)
 
+    # порты, которые ловят профили Flowseal (например, голос Discord по TCP 2053-8443)
+    for p in fs_profiles:
+        for t in p:
+            for opt, target in (("--filter-tcp=", wf_tcp), ("--filter-udp=", wf_udp)):
+                if t.startswith(opt):
+                    target.extend(x for x in t[len(opt):].split(",") if x not in target)
+
     args = [str(BIN / "winws.exe"), f"--wf-tcp={','.join(wf_tcp)}", f"--wf-udp={','.join(wf_udp)}"]
-    profiles: list[list[str]] = []
+    profiles: list[list[str]] = list(fs_profiles)   # Flowseal первыми: winws берёт первый подходящий
 
     for pid, hostlists in groups.items():
         p = PRESETS_BY_ID[pid]
@@ -215,7 +259,7 @@ class Engine:
         return _alive(self.proc) or _alive(self.tg_proc) or _alive(self.gdpi_proc)
 
     def start(self, service_ids: list[str], preset_id: str, tg_secret: str | None = None,
-              overrides: dict[str, str] | None = None) -> None:
+              overrides: dict[str, str] | None = None, strategy: str | None = None) -> None:
         """Привести запущенное к выбранному. Перезапускается только то, что изменилось:
         например, включение Telegram не рвёт обход YouTube, и наоборот.
         overrides — свой пресет для отдельных сервисов (id сервиса -> id пресета)."""
@@ -228,7 +272,7 @@ class Engine:
         dpi = [s.id for s in svc if not s.tgproxy and (not s.gdpi or s.ipset)]
         gdpi = tuple(sorted(s.id for s in svc if s.gdpi))
         overrides = {s: p for s, p in (overrides or {}).items() if s in dpi and p in PRESETS_BY_ID}
-        key = (tuple(sorted(dpi)), preset_id, tuple(sorted(overrides.items())))
+        key = (tuple(sorted(dpi)), preset_id, tuple(sorted(overrides.items())), strategy)
 
         if not gdpi:
             self._stop_gdpi()
@@ -241,7 +285,7 @@ class Engine:
         elif not (_alive(self.proc) and self.winws_key == key):
             self._stop_winws()
             kill_stray()
-            self._start_winws(dpi, preset_id, overrides)
+            self._start_winws(dpi, preset_id, overrides, strategy)
             self.winws_key = key
 
         if tg_secret and any(s.tgproxy for s in svc):
@@ -255,10 +299,11 @@ class Engine:
         _terminate(self.proc)
         self.proc = self.winws_key = None
 
-    def _start_winws(self, service_ids: list[str], preset_id: str, overrides: dict[str, str]) -> None:
+    def _start_winws(self, service_ids: list[str], preset_id: str, overrides: dict[str, str],
+                     strategy: str | None = None) -> None:
         if not (BIN / "winws.exe").exists():
             raise FileNotFoundError(f"Нет {BIN / 'winws.exe'}")
-        args = build_args(service_ids, PRESETS_BY_ID[preset_id], overrides)
+        args = build_args(service_ids, PRESETS_BY_ID[preset_id], overrides, strategy)
         log = open(LOG, "w", encoding="utf-8", errors="replace")
         self.proc = subprocess.Popen(args, cwd=BIN, stdout=log, stderr=subprocess.STDOUT,
                                      creationflags=NO_WINDOW)
@@ -395,14 +440,47 @@ def check_services(service_ids: list[str]) -> dict[str, bool]:
     return {s: r is None for s, r in check_details(service_ids, retry=False).items()}
 
 
-def autodetect(engine: Engine, service_ids: list[str],
-               on_progress=print) -> tuple[str, dict[str, str]] | None:
+def autodetect_strategy(engine: Engine, service_ids: list[str], preset_id: str,
+                        on_progress=print) -> str | None:
+    """Перебирает стратегии Flowseal для YouTube + Discord: первая, где открылись оба;
+    если такой нет — та, где открылось больше; None — если не помогла ни одна."""
+    testable = [s for s in FLOWSEAL_SERVICES if s in service_ids]
+    dpi = [s for s in service_ids if not SERVICES_BY_ID[s].tgproxy and not SERVICES_BY_ID[s].gdpi]
+    best, best_score = None, 0
+    for name in strategy_names():
+        on_progress(tr("eng.try", name=name))
+        try:
+            engine.start(dpi, preset_id, strategy=name)
+            time.sleep(1)
+            res = check_services(testable)
+        except Exception as e:
+            on_progress(tr("eng.try_err", e=e))
+            continue
+        finally:
+            engine.stop()
+        on_progress("  " + ", ".join(f"{svc_name(k)}: {tr('eng.yes') if v else tr('eng.no')}"
+                                     for k, v in res.items()))
+        score = sum(res.values())
+        if score == len(testable):
+            return name
+        if score > best_score:
+            best, best_score = name, score
+    return best
+
+
+def autodetect(engine: Engine, service_ids: list[str], on_progress=print,
+               exclude: tuple = ()) -> tuple[str, dict[str, str]] | None:
     """Перебирает пресеты и для каждого сервиса запоминает первый, при котором он открылся.
     Возвращает (основной пресет, {сервис: свой пресет}) или None, если не помог ни один.
-    Основной — тот, что подошёл большинству; свой пресет — только у тех, кому нужен другой."""
+    Основной — тот, что подошёл большинству; свой пресет — только у тех, кому нужен другой.
+    exclude — сервисы, которые подбираются отдельно (YouTube и Discord — по стратегиям Flowseal)."""
     # от пресета zapret зависят только сервисы, которые идут через winws по списку доменов
-    testable = [s for s in service_ids if s in TEST_URLS
-                and not SERVICES_BY_ID[s].gdpi and not SERVICES_BY_ID[s].tgproxy] or ["youtube", "discord"]
+    testable = [s for s in service_ids if s in TEST_URLS and s not in exclude
+                and not SERVICES_BY_ID[s].gdpi and not SERVICES_BY_ID[s].tgproxy]
+    if not testable:
+        if exclude:
+            return None   # подбирать нечего — всё нужное подбирается отдельно
+        testable = ["youtube", "discord"]
     dpi = [s for s in service_ids if not SERVICES_BY_ID[s].tgproxy and not SERVICES_BY_ID[s].gdpi] or testable
     works: dict[str, list[str]] = {s: [] for s in testable}   # сервис -> пресеты, где открылся
     for p in PRESETS:
