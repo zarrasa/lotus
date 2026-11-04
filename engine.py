@@ -202,12 +202,17 @@ def build_args(service_ids: list[str], preset: Preset, overrides: dict[str, str]
         profiles.append([f"--filter-udp={DISCORD_VOICE_PORTS}", "--filter-l7=discord,stun",
                          "--dpi-desync=fake", "--dpi-desync-repeats=6"])
 
+    # игры, которые не блокируют, но которые ломаются от фейков (League of Legends и др. от Riot):
+    # их домены и сеть игровые правила не трогают
+    exclude = [f"--hostlist-exclude={LISTS / 'games-exclude.txt'}"] if (LISTS / "games-exclude.txt").exists() else []
+    if (LISTS / "ipset-games-exclude.txt").exists():
+        exclude.append(f"--ipset-exclude={LISTS / 'ipset-games-exclude.txt'}")
     for g in games:
         ipset = f"--ipset={LISTS / g.ipset}"
         # у Steam HTTPS (443) уже обрабатывает GoodbyeDPI — два обхода на одних пакетах ломают вход
         tcp = GAME_PORTS if g.gdpi else f"443,{GAME_PORTS}"
-        profiles.append([f"--filter-tcp={tcp}", ipset, *_sub(pick(g.id).tls)])
-        profiles.append([f"--filter-udp={GAME_PORTS}", ipset,
+        profiles.append([f"--filter-tcp={tcp}", ipset, *exclude, *_sub(pick(g.id).tls)])
+        profiles.append([f"--filter-udp={GAME_PORTS}", ipset, *exclude,
                          "--dpi-desync=fake", "--dpi-desync-autottl=2", "--dpi-desync-repeats=12",
                          "--dpi-desync-any-protocol=1",
                          f"--dpi-desync-fake-unknown-udp={FAKE / 'quic_initial_www_google_com.bin'}",

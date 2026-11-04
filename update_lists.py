@@ -23,6 +23,12 @@ VALVE_FALLBACK = [
 ]
 
 
+RIOT_ASN_URL = "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS6507"
+# известные сети Riot Games — на случай, если реестр недоступен
+RIOT_FALLBACK = ["192.64.168.0/21", "162.249.72.0/21", "104.160.128.0/19", "185.40.64.0/22",
+                 "151.106.240.0/20", "138.0.12.0/23", "45.7.36.0/22", "192.207.0.0/24"]
+
+
 def _get(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "Lotus"})
     with urllib.request.urlopen(req, timeout=30) as r:
@@ -45,6 +51,18 @@ def _valve() -> set[str]:
     except Exception:
         pass
     return nets
+
+
+def riot() -> list[str]:
+    """Сеть Riot Games (League of Legends, Valorant): её игровые правила не трогают —
+    LoL не блокируют, а фейковые пакеты его сервера отбрасывают («нет соединения»)."""
+    nets = set(RIOT_FALLBACK)
+    try:
+        data = json.loads(_get(RIOT_ASN_URL))
+        nets |= {p["prefix"] for p in data["data"]["prefixes"] if ":" not in p["prefix"]}
+    except Exception:
+        pass
+    return sorted(nets)
 
 
 def fetch_game_ranges() -> list[str]:
@@ -70,6 +88,7 @@ def update(lists_dir: Path) -> int:
     # отдельно только Valve — для плитки Steam (игры Steam работают и без плитки «Игры»)
     valve = sorted(_valve())
     (lists_dir / "ipset-valve.txt").write_text("\n".join(valve) + "\n", encoding="utf-8")
+    (lists_dir / "ipset-games-exclude.txt").write_text("\n".join(riot()) + "\n", encoding="utf-8")
     return len(nets)
 
 

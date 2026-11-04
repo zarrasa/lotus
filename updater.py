@@ -97,7 +97,7 @@ def ipset_is_old() -> bool:
         return True
     # до версии 1.0.3 не было отдельного списка серверов Valve (игры Steam), а в 1.0.2 сеть Valve
     # лежала в списке «Игр» — там она пересекается с GoodbyeDPI у Steam. Такие списки обновить сразу.
-    if not (engine.LISTS / "ipset-valve.txt").exists():
+    if not (engine.LISTS / "ipset-valve.txt").exists() or not (engine.LISTS / "ipset-games-exclude.txt").exists():
         return True
     return "\n155.133." in "\n" + p.read_text(encoding="utf-8")
 
