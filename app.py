@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 import time
+import tkinter as tk
 from tkinter import messagebox
 
 import customtkinter as ctk
@@ -27,13 +28,25 @@ from version import VERSION
 ICONS = engine.ROOT / "icons"
 
 W, H = 340, 520
-# id -> (x, y, w, h); «Игры» и «Свои сайты» — широкие плитки
+# id плитки -> (x, y, w, h); «YouTube + Discord», «Игры» и «Свои сайты» — широкие плитки
 TILES = {
-    "youtube": (16, 60, 150, 88), "discord": (174, 60, 150, 88),
+    "ytdc": (16, 60, 308, 88),
     "telegram": (16, 156, 150, 88), "steam": (174, 156, 150, 88),
     "meta": (16, 252, 150, 88), "twitch": (174, 252, 150, 88),
     "games": (16, 348, 308, 56), "custom": (16, 412, 308, 56),
 }
+# плитка, которая включает сразу несколько сервисов; у остальных плитка = один сервис
+TILE_SERVICES = {"ytdc": ("youtube", "discord")}
+PRESET_TILE = "ytdc"   # у этой плитки справа стрелочка с выбором пресета
+ARROW_ZONE = 120       # ширина зоны стрелочки справа сверху на плитке
+
+
+def tile_services(tid: str) -> tuple:
+    return TILE_SERVICES.get(tid, (tid,))
+
+
+def tile_name(tid: str) -> str:
+    return tr(f"tile.{tid}") if tid in TILE_SERVICES else svc_name(tid)
 THEMED_ICONS = ("games", "custom")   # значки в стиле приложения, перекрашиваются под тему
 PILL = (210, 17, 86, 24)
 
@@ -128,18 +141,21 @@ class App(ctk.CTk):
         self.spin: dict[str, float] = {}      # когда у плитки побежал огонёк (сервис включается)
         self.hover_lvl = {sid: 0.0 for sid in TILES}
         self.hover: str | None = None
-        self.was_on = {sid: sid in self.cfg["services"] for sid in TILES}
+        self.was_on = {sid: self.tile_on(sid) for sid in TILES}
         for sid, (x, y, w, h) in TILES.items():
             if h < 80:
-                nm = self.text(x + 56, y + h / 2, svc_name(sid), 14, R.T.text, bold=True, anchor="w")
+                nm = self.text(x + 56, y + h / 2, tile_name(sid), 14, R.T.text, bold=True, anchor="w")
                 st = self.text(x + w - 14, y + h / 2, "", 11, R.T.muted, anchor="e")
             else:
-                nm = self.text(x + 14, y + 52, svc_name(sid), 14, R.T.text, bold=True, anchor="nw")
+                nm = self.text(x + 14, y + 52, tile_name(sid), 14, R.T.text, bold=True, anchor="nw")
                 st = self.text(x + 14, y + 71, "", 11, R.T.muted, anchor="nw")
             self.items[sid] = (None, nm, st)
             self.glow[sid] = 1.0 if self.was_on[sid] else 0.0
+        # стрелочка с текущим пресетом справа сверху на плитке «YouTube + Discord»
+        x, y, w, h = TILES[PRESET_TILE]
+        self.arrow = self.text(x + w - 14, y + 24, "", 12, R.T.text_off, anchor="e")
         # клики и наведение — по координатам: плитки нарисованы картинкой, а не виджетами
-        self.canvas.bind("<Button-1>", lambda e: (k := self._hit(e)) and self.on_tile(k))
+        self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<Motion>", lambda e: self._set_hover(self._hit(e)))
         self.canvas.bind("<Leave>", lambda e: self._set_hover(None))
 
@@ -161,7 +177,7 @@ class App(ctk.CTk):
             pass
 
         # заранее посчитать маску огонька (~70 мс), чтобы первая анимация не дёрнулась
-        threading.Thread(target=lambda: [R.comet(w, h, s, 0) for w, h in {(150, 88), (308, 56)}],
+        threading.Thread(target=lambda: [R.comet(w, h, s, 0) for w, h in {(150, 88), (308, 56), (308, 88)}],
                          daemon=True).start()
         self.refresh()
         self._tick()
@@ -184,7 +200,19 @@ class App(ctk.CTk):
             pass
 
     def _load_icons(self) -> None:
-        self.icons = {sid: Image.open(ICONS / f"{sid}.png").convert("RGBA") for sid in TILES}
+        load = lambda name: Image.open(ICONS / f"{name}.png").convert("RGBA")
+        self.icons = {}
+        for sid in TILES:
+            parts = [load(s) for s in tile_services(sid)]
+            if len(parts) == 1:
+                self.icons[sid] = parts[0]
+                continue
+            # несколько сервисов — их иконки рядом в одну строку
+            n, gap = parts[0].height, parts[0].height // 6
+            row = Image.new("RGBA", (n * len(parts) + gap * (len(parts) - 1), n), (0, 0, 0, 0))
+            for i, im in enumerate(parts):
+                row.alpha_composite(im.resize((n, n)), (i * (n + gap), 0))
+            self.icons[sid] = row
         for sid in THEMED_ICONS:
             self.icons[sid] = R.themed_icon(self.icons[sid])
         self.icons_off = {sid: R.faded(im) for sid, im in self.icons.items()}
@@ -227,7 +255,7 @@ class App(ctk.CTk):
         self.cfg["lang"] = lang
         engine.save_config(self.cfg)
         for sid, (_, nm, _) in self.items.items():
-            self.canvas.itemconfigure(nm, text=svc_name(sid))
+            self.canvas.itemconfigure(nm, text=tile_name(sid))
         self.canvas.itemconfigure(self.msg, text=tr("hint"))
         self.tray.menu = self._tray_menu()
         self.tray.update_menu()
@@ -256,8 +284,12 @@ class App(ctk.CTk):
         if self.layers.get(name, (None,))[0] != key:
             self.layers[name] = (key, make(), x, y)
 
+    def tile_on(self, tid: str) -> bool:
+        """Плитка включена, если включены все её сервисы."""
+        return all(s in self.cfg["services"] for s in tile_services(tid))
+
     def _draw_tile(self, sid: str, spin: int | None = None) -> None:
-        on = sid in self.cfg["services"]
+        on = self.tile_on(sid)
         glow = round((self.glow[sid] + 0.2 * self.hover_lvl[sid]) * 50) / 50   # шаг 0.02
         x, y, w, h = TILES[sid]
         icon = self.icons[sid] if on else self.icons_off[sid]
@@ -295,7 +327,7 @@ class App(ctk.CTk):
         started = time.perf_counter()
         pending = (tr("st.starting"), tr("st.checking"))
         for sid in TILES:
-            on = sid in self.cfg["services"]
+            on = self.tile_on(sid)
             target = 1.0 if self.hover == sid else 0.0
             self.hover_lvl[sid] += (target - self.hover_lvl[sid]) * 0.25
 
@@ -326,6 +358,55 @@ class App(ctk.CTk):
                 return sid
         return None
 
+    def _on_arrow(self, e) -> bool:
+        """Клик пришёлся на стрелочку с пресетом (справа сверху на плитке YouTube + Discord)."""
+        x, y = e.x / self.s, e.y / self.s
+        tx, ty, w, h = TILES[PRESET_TILE]
+        return tx + w - ARROW_ZONE <= x <= tx + w and ty <= y <= ty + 44
+
+    def _on_click(self, e) -> None:
+        if self._on_arrow(e):
+            self.preset_menu(e.x_root, e.y_root)
+        elif k := self._hit(e):
+            self.on_tile(k)
+
+    def preset_menu(self, x: int, y: int) -> None:
+        """Список пресетов для YouTube и Discord: название, когда выбирать, и автоподбор."""
+        cur = self.tile_preset(PRESET_TILE)
+        menu = tk.Menu(self, tearoff=0, bg=R.T.field_bg, fg=R.T.text, activebackground=R.T.accent_hex,
+                       activeforeground="#FFFFFF", bd=0, font=("Segoe UI", 10))
+        for p in PRESETS:
+            mark = "✓  " if p.id == cur else "     "
+            menu.add_command(label=f"{mark}{tr(f'preset.{p.id}')}  ·  {tr(f'phint.{p.id}')}",
+                             command=lambda pid=p.id: self.set_tile_preset(PRESET_TILE, pid))
+        menu.add_separator()
+        menu.add_command(label="     " + tr("set.auto"), command=lambda: self.run_bg(self.run_autodetect))
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def tile_preset(self, tid: str) -> str | None:
+        """Пресет сервисов плитки; None — если у них разные (подобраны по отдельности)."""
+        ov = self.cfg.get("overrides", {})
+        presets = {ov.get(s, self.cfg["preset"]) for s in tile_services(tid)}
+        return presets.pop() if len(presets) == 1 else None
+
+    def set_tile_preset(self, tid: str, pid: str) -> None:
+        """Пресет только для сервисов этой плитки — остальные не трогаем."""
+        ov = self.cfg.setdefault("overrides", {})
+        for s in tile_services(tid):
+            if pid == self.cfg["preset"]:
+                ov.pop(s, None)   # совпадает с общим — отдельный не нужен
+            else:
+                ov[s] = pid
+        engine.save_config(self.cfg)
+        self.log(tr("msg.tile_preset", tile=tile_name(tid), name=tr(f"preset.{pid}")))
+        if any(s in self.selected() for s in tile_services(tid)):
+            self.apply()
+        self.refresh()
+        self._reopen_settings()
+
     def _set_hover(self, sid: str | None) -> None:
         if sid != self.hover:
             self.hover = sid
@@ -342,8 +423,8 @@ class App(ctk.CTk):
         def toggle(sid):
             return lambda: self.post(lambda: self.on_tile(sid))
 
-        services = [pystray.MenuItem(svc_name(sid), toggle(sid),
-                                     checked=lambda item, k=sid: k in self.cfg["services"])
+        services = [pystray.MenuItem(tile_name(sid), toggle(sid),
+                                     checked=lambda item, k=sid: self.tile_on(k))
                     for sid in TILES]
         return pystray.Menu(
             pystray.MenuItem(tr("tray.open"), lambda: self.post(self.show_window), default=True),
@@ -475,7 +556,8 @@ class App(ctk.CTk):
         running = self.engine.running
         sel = self.selected()
         for sid in TILES:
-            on = sid in sel
+            on = self.tile_on(sid)
+            svcs = tile_services(sid)
             if not on:
                 text, color = tr("st.off"), R.T.muted
             elif sid == "custom" and not engine.domains("custom"):
@@ -488,12 +570,16 @@ class App(ctk.CTk):
                 text, color = tr("st.subnets", n=count_ipset()), R.T.ok
             elif sid == "custom":
                 text, color = tr("st.sites", n=len(engine.domains("custom"))), R.T.ok
-            elif sid not in self.results:
+            elif any(s not in self.results for s in svcs):
                 text, color = tr("st.checking"), R.T.muted
-            elif self.results[sid]:
-                text, color = tr("st.ok"), R.T.ok
+            elif all(self.results[s] for s in svcs):
+                text, color = tr("st.ok_many" if len(svcs) > 1 else "st.ok"), R.T.ok
             else:
-                text, color = tr(self.reasons.get(sid, "st.fail")), R.T.err
+                bad = next(s for s in svcs if not self.results[s])
+                reason = tr(self.reasons.get(bad, "st.fail"))
+                # у плитки на несколько сервисов — уточнить, какой именно не работает
+                text = f"{svc_name(bad)}: {reason}" if len(svcs) > 1 else reason
+                color = R.T.err
             _, nm, st = self.items[sid]
             self.canvas.itemconfigure(st, text=text, fill=color)
             self.canvas.itemconfigure(nm, fill=R.T.text if on else R.T.text_off)
@@ -502,6 +588,9 @@ class App(ctk.CTk):
                 if not on:
                     self.spin.pop(sid, None)
                     self.anim[sid] = fade_frames(max(self.glow[sid], 0.6))
+        p = self.tile_preset(PRESET_TILE)
+        self.canvas.itemconfigure(self.arrow, text=(tr(f"preset.{p}") if p else tr("st.two_presets")) + "  ▼",
+                                  fill=R.T.text if self.tile_on(PRESET_TILE) else R.T.text_off)
         self._draw_pill(running)
         if hasattr(self, "tray"):
             self.tray.update_menu()
@@ -644,13 +733,19 @@ class App(ctk.CTk):
 
     # --- действия ---
 
-    def on_tile(self, sid: str) -> None:
+    def on_tile(self, tid: str) -> None:
+        """Включить/выключить все сервисы плитки (у «YouTube + Discord» — оба сразу)."""
         sel = self.selected()
-        sel.remove(sid) if sid in sel else sel.append(sid)
+        turn_on = not self.tile_on(tid)
+        for s in tile_services(tid):
+            if turn_on and s not in sel:
+                sel.append(s)
+            elif not turn_on and s in sel:
+                sel.remove(s)
+            self.results.pop(s, None)
+            self.reasons.pop(s, None)
         self.cfg["services"] = sel
         engine.save_config(self.cfg)
-        self.results.pop(sid, None)
-        self.reasons.pop(sid, None)
         self.apply()
         self.refresh()
 

@@ -176,8 +176,8 @@ def tile(w: int, h: int, s: float, glow: float, icon: Image.Image | None = None,
     out = (comet(w, h, s, spin, radius) if spin is not None
            else _glass(w, h, s, round(glow, 2), radius)).copy()
     if icon is not None:
-        n = int(icon_size * s)
-        out.alpha_composite(icon.resize((n, n), Image.LANCZOS),
+        n = int(icon_size * s)   # высота; ширина — по пропорциям (несколько иконок в ряд)
+        out.alpha_composite(icon.resize((round(n * icon.width / icon.height), n), Image.LANCZOS),
                             (P + int(icon_xy[0] * s), P + int(icon_xy[1] * s)))
     return out
 
