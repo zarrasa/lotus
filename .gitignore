@@ -13,3 +13,8 @@ __pycache__/
 # настройки и логи запуска из исходников
 config.json
 *.log
+
+# исключения пользователя (из настроек)
+exclusions.txt
+lists/user-exclude.txt
+lists/ipset-user-exclude.txt

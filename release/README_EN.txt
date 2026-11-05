@@ -51,7 +51,9 @@ Every 5 minutes Lotus checks the enabled services itself; if one stops working,
 it picks another bypass method and shows a notification.
 Still blocked? ⚙ → "Pick automatically", or choose another preset manually.
 Games don't connect — ⚙ → "Update game IPs". Steam doesn't open — close other
-bypass tools (GoodbyeDPI, zapret, VPN). Include the log from ⚙ when asking for help.
+bypass tools (GoodbyeDPI, zapret, VPN). A game says "no connection" only while
+Lotus is on — start the game, open ⚙ → "Exclusions" → "Add a running game" and pick
+it: Lotus will leave its traffic alone. Include the log from ⚙ when asking for help.
 
 
 PRESETS

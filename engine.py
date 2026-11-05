@@ -1,6 +1,7 @@
 """Движок: собирает команду для winws.exe (zapret), запускает/останавливает, проверяет доступ."""
 
 import ctypes
+import ipaddress
 import json
 import os
 import re
@@ -52,6 +53,111 @@ def domains(service_id: str) -> list[str]:
     except OSError:
         return []
     return [l.strip() for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+
+# ---------- исключения: игры и сайты, которые Lotus не трогает ----------
+# Пользователь ведёт один список (домены, IP, подсети, комментарии «# имя игры»),
+# а для winws из него собираются два файла без комментариев.
+EXCLUDE_SRC = DATA / "exclusions.txt"
+EXCLUDE_HOSTS = LISTS / "user-exclude.txt"
+EXCLUDE_IPS = LISTS / "ipset-user-exclude.txt"
+
+
+def _ip_net(text: str) -> str | None:
+    try:
+        return str(ipaddress.ip_network(text, strict=False))
+    except ValueError:
+        return None
+
+
+def parse_exclusions(text: str) -> tuple[list[str], list[str], list[str]]:
+    """Текст из настроек -> (строки для показа, домены, подсети). Мусор отбрасывается."""
+    lines, hosts, nets = [], [], []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            if line not in lines:   # одну игру добавили дважды — подпись одна
+                lines.append(line)
+            continue
+        item = re.sub(r"^(https?://)?(www\.)?", "", line.lower()).split("/")[0] if not _ip_net(line) else line
+        if net := _ip_net(item):
+            if net not in nets:
+                nets.append(net)
+                lines.append(net)
+        elif "." in item and re.fullmatch(r"[a-z0-9.-]+", item) and item not in hosts:
+            hosts.append(item)
+            lines.append(item)
+    return lines, hosts, nets
+
+
+def exclusions_text() -> str:
+    try:
+        return EXCLUDE_SRC.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def save_exclusions(text: str) -> tuple[int, int]:
+    """Сохранить список исключений; вернуть (доменов, подсетей)."""
+    lines, hosts, nets = parse_exclusions(text)
+    EXCLUDE_SRC.parent.mkdir(parents=True, exist_ok=True)
+    EXCLUDE_SRC.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    EXCLUDE_HOSTS.write_text("\n".join(hosts) + ("\n" if hosts else ""), encoding="utf-8")
+    EXCLUDE_IPS.write_text("\n".join(nets) + ("\n" if nets else ""), encoding="utf-8")
+    return len(hosts), len(nets)
+
+
+def user_exclude_args() -> list[str]:
+    """Опции winws, чтобы ни один профиль не трогал исключённое. Пустой файл не передаём."""
+    out = []
+    for opt, path in (("--hostlist-exclude", EXCLUDE_HOSTS), ("--ipset-exclude", EXCLUDE_IPS)):
+        try:
+            if path.read_text(encoding="utf-8").strip():
+                out.append(f"{opt}={path}")
+        except OSError:
+            pass
+    return out
+
+
+# программы, которые точно не игры: их в выборе «запущенной игры» не показываем
+NOT_GAMES = {"svchost.exe", "system", "lsass.exe", "services.exe", "wininit.exe", "explorer.exe",
+             "chrome.exe", "msedge.exe", "firefox.exe", "opera.exe", "browser.exe", "brave.exe",
+             "msedgewebview2.exe", "searchhost.exe", "onedrive.exe", "lotus.exe", "winws.exe",
+             "goodbyedpi.exe", "python.exe", "pythonw.exe", "claude.exe", "telegram.exe",
+             "discord.exe", "spoolsv.exe", "smartscreen.exe", "msmpeng.exe", "nissrv.exe",
+             "phoneexperiencehost.exe", "widgets.exe", "code.exe", "steamwebhelper.exe"}
+
+
+def running_games() -> dict[str, list[str]]:
+    """Какие программы сейчас держат соединения с интернетом: имя -> подсети /24 серверов.
+    Игра — одна из них; её сервера можно добавить в исключения одной кнопкой."""
+    flags = {"capture_output": True, "text": True, "creationflags": NO_WINDOW, "errors": "replace"}
+    names = {}
+    for line in subprocess.run(["tasklist", "/FO", "CSV", "/NH"], **flags).stdout.splitlines():
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) > 1 and parts[1].isdigit():
+            names[parts[1]] = parts[0]
+    found: dict[str, set] = {}
+    for line in subprocess.run(["netstat", "-ano", "-p", "TCP"], **flags).stdout.splitlines():
+        cols = line.split()
+        if len(cols) != 5 or cols[0] != "TCP" or not cols[4].isdigit():
+            continue
+        host = cols[2].rsplit(":", 1)[0]
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if ip.version != 4 or not ip.is_global:
+            continue
+        if cols[4] in ("0", "4"):   # закрывающиеся соединения (Idle) и ядро Windows
+            continue
+        name = names.get(cols[4], "")
+        if not name or name.lower() in NOT_GAMES:
+            continue
+        found.setdefault(name, set()).add(str(ipaddress.ip_network(f"{ip}/24", strict=False)))
+    return {n: sorted(s) for n, s in sorted(found.items(), key=lambda kv: (-len(kv[1]), kv[0].lower()))}
 
 
 def install_runtime() -> None:
@@ -218,10 +324,12 @@ def build_args(service_ids: list[str], preset: Preset, overrides: dict[str, str]
                          f"--dpi-desync-fake-unknown-udp={FAKE / 'quic_initial_www_google_com.bin'}",
                          "--dpi-desync-cutoff=n3"])
 
+    # исключения пользователя — в каждый профиль, включая стратегии Flowseal
+    user_ex = user_exclude_args()
     for i, p in enumerate(profiles):
         if i:
             args.append("--new")
-        args.extend(p)
+        args.extend(p + user_ex)
     return args
 
 

@@ -388,7 +388,10 @@ class App(ctk.CTk):
             self.on_tile(tid)
 
     def _on_escape(self) -> None:
-        if self.popup:
+        picker = self.settings.picker if self.settings and self.settings.winfo_exists() else None
+        if picker and picker.winfo_exists():
+            picker.destroy()
+        elif self.popup:
             self.close_popup()
         elif self.settings and self.settings.winfo_exists():
             self.close_settings()
@@ -777,6 +780,24 @@ class App(ctk.CTk):
         self.apply()
         self.refresh()
 
+    def save_exclusions(self, text: str) -> None:
+        """Сохранить исключения и перезапустить обход, чтобы они сразу заработали."""
+        hosts, nets = engine.save_exclusions(text)
+        self.log(tr("msg.excl_saved", h=hosts, n=nets))
+        self.engine.invalidate()
+        if self.selected():
+            self.apply()
+        if self.settings and self.settings.winfo_exists():
+            self.settings.excl.delete("1.0", "end")
+            self.settings.excl.insert("1.0", engine.exclusions_text())
+
+    def exclude_game(self, name: str, nets: list[str]) -> None:
+        """Добавить сервера запущенной игры в исключения (подпись — имя её .exe)."""
+        text = engine.exclusions_text().rstrip("\n")
+        text += ("\n" if text else "") + f"# {name}\n" + "\n".join(nets)
+        self.save_exclusions(text)
+        self.log(tr("msg.excl_game", name=name, n=len(nets)))
+
     def save_custom_sites(self, text: str) -> None:
         sites = []
         for line in text.splitlines():
@@ -916,6 +937,39 @@ class StrategyMenu(ctk.CTkFrame):
         self.app.run_bg(self.app.run_autodetect)
 
 
+class GamePicker(ctk.CTkFrame):
+    """Список программ, которые сейчас ходят в интернет: нажал на игру — её сервера в исключениях."""
+
+    def __init__(self, panel: "Settings", games: dict[str, list[str]]) -> None:
+        super().__init__(panel, width=W - 28, height=400, corner_radius=14, fg_color=R.T.field_bg,
+                         border_width=1, border_color=R.T.accent_hex, bg_color=R.T.window_bg)
+        self.pack_propagate(False)
+        self.app = panel.app
+        ctk.CTkLabel(self, text=tr("gp.title"), text_color=R.T.text,
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=14, pady=(12, 0))
+        ctk.CTkLabel(self, text=tr("gp.hint"), text_color=R.T.text_off, font=ctk.CTkFont(size=11),
+                     wraplength=W - 60, justify="left").pack(anchor="w", padx=14, pady=(2, 4))
+        ctk.CTkButton(self, text=tr("gp.cancel"), command=self.destroy, height=32, corner_radius=10,
+                      fg_color=R.T.window_bg, border_width=1, border_color=R.T.border,
+                      text_color=R.T.text, hover_color=R.T.hover).pack(side="bottom", fill="x", padx=10, pady=(4, 10))
+        lst = ctk.CTkScrollableFrame(self, fg_color=R.T.field_bg, scrollbar_button_color=R.T.border,
+                                     scrollbar_button_hover_color=R.T.accent_hex)
+        lst.pack(fill="both", expand=True, padx=(4, 2))
+        if not games:
+            ctk.CTkLabel(lst, text=tr("gp.empty"), text_color=R.T.muted, font=ctk.CTkFont(size=12),
+                         wraplength=W - 80, justify="left").pack(anchor="w", padx=8, pady=8)
+        for name, nets in games.items():
+            ctk.CTkButton(lst, text=f"{name}   ·   {tr('gp.servers', n=len(nets))}", anchor="w", height=30,
+                          corner_radius=8, fg_color="transparent", hover_color=R.T.hover, text_color=R.T.text,
+                          command=lambda n=name, s=nets: self.pick(n, s)).pack(fill="x", padx=2)
+        self.place(x=14, y=60)
+        self.lift()
+
+    def pick(self, name: str, nets: list[str]) -> None:
+        self.destroy()
+        self.app.exclude_game(name, nets)
+
+
 def tray_icon(logo: str, state: str) -> Image.Image:
     """Значок в трее по состоянию: off — серый, on — цветной логотип, warn — с оранжевой точкой."""
     img = Image.open(ICONS / f"{logo}.png").convert("RGBA").resize((64, 64), Image.LANCZOS)
@@ -1030,6 +1084,20 @@ class Settings(ctk.CTkFrame):
         button(body, tr("set.sites_save"),
                lambda: app.save_custom_sites(self.sites.get("1.0", "end"))).pack(fill="x", padx=14, pady=(6, 0))
 
+        # исключения: игры и сайты, которые обход не трогает
+        section(tr("set.excl"))
+        ctk.CTkLabel(body, text=tr("set.excl_hint"), text_color=R.T.text_off, font=ctk.CTkFont(size=11),
+                     wraplength=290, justify="left").pack(anchor="w", padx=14, pady=(0, 6))
+        button(body, tr("set.excl_game"), self.on_add_game).pack(fill="x", padx=14, pady=(0, 6))
+        self.excl = ctk.CTkTextbox(body, height=90, corner_radius=10, fg_color=R.T.field_bg,
+                                   text_color=R.T.text, border_width=1, border_color=R.T.border,
+                                   font=ctk.CTkFont(family="Consolas", size=12))
+        self.excl.insert("1.0", engine.exclusions_text())
+        self.excl.pack(fill="x", padx=14)
+        button(body, tr("set.excl_save"),
+               lambda: app.save_exclusions(self.excl.get("1.0", "end"))).pack(fill="x", padx=14, pady=(6, 0))
+        self.picker: GamePicker | None = None
+
         # переключатели
         self.watch = switch(tr("set.watch"), app.cfg.get("watchdog", True), self.on_watch)
         self.autostart = switch(tr("set.autostart"), app.autostart_on,
@@ -1124,6 +1192,25 @@ class Settings(ctk.CTkFrame):
             count_ipset.cache = None
             a.log(tr("msg.ipset", n=n))
         a.run_bg(go)
+
+    def on_add_game(self) -> None:
+        """Найти программы с интернет-соединениями (это ~полсекунды) и показать выбор."""
+        if self.picker and self.picker.winfo_exists():
+            return
+        a = self.app
+
+        def go():
+            try:
+                games = engine.running_games()
+            except Exception as e:
+                a.log(tr("msg.error", e=e))
+                return
+            a.post(lambda: self._show_picker(games))
+        threading.Thread(target=go, daemon=True).start()
+
+    def _show_picker(self, games: dict) -> None:
+        if self.winfo_exists():
+            self.picker = GamePicker(self, games)
 
     def on_tg(self) -> None:
         a = self.app
