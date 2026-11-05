@@ -388,10 +388,7 @@ class App(ctk.CTk):
             self.on_tile(tid)
 
     def _on_escape(self) -> None:
-        picker = self.settings.picker if self.settings and self.settings.winfo_exists() else None
-        if picker and picker.winfo_exists():
-            picker.destroy()
-        elif self.popup:
+        if self.popup:
             self.close_popup()
         elif self.settings and self.settings.winfo_exists():
             self.close_settings()
@@ -798,6 +795,17 @@ class App(ctk.CTk):
         self.save_exclusions(text)
         self.log(tr("msg.excl_game", name=name, n=len(nets)))
 
+    def exclude_site(self, text: str) -> bool:
+        """Добавить сайт в исключения. False — это не похоже на адрес сайта."""
+        _, hosts, nets = engine.parse_exclusions(text)
+        if not hosts and not nets:
+            self.log(tr("msg.excl_bad", text=text.strip()))
+            return False
+        cur = engine.exclusions_text().rstrip("\n")
+        self.save_exclusions(cur + ("\n" if cur else "") + "\n".join(hosts + nets))
+        self.log(tr("msg.excl_site", name=", ".join(hosts + nets)))
+        return True
+
     def save_custom_sites(self, text: str) -> None:
         sites = []
         for line in text.splitlines():
@@ -937,39 +945,6 @@ class StrategyMenu(ctk.CTkFrame):
         self.app.run_bg(self.app.run_autodetect)
 
 
-class GamePicker(ctk.CTkFrame):
-    """Список программ, которые сейчас ходят в интернет: нажал на игру — её сервера в исключениях."""
-
-    def __init__(self, panel: "Settings", games: dict[str, list[str]]) -> None:
-        super().__init__(panel, width=W - 28, height=400, corner_radius=14, fg_color=R.T.field_bg,
-                         border_width=1, border_color=R.T.accent_hex, bg_color=R.T.window_bg)
-        self.pack_propagate(False)
-        self.app = panel.app
-        ctk.CTkLabel(self, text=tr("gp.title"), text_color=R.T.text,
-                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=14, pady=(12, 0))
-        ctk.CTkLabel(self, text=tr("gp.hint"), text_color=R.T.text_off, font=ctk.CTkFont(size=11),
-                     wraplength=W - 60, justify="left").pack(anchor="w", padx=14, pady=(2, 4))
-        ctk.CTkButton(self, text=tr("gp.cancel"), command=self.destroy, height=32, corner_radius=10,
-                      fg_color=R.T.window_bg, border_width=1, border_color=R.T.border,
-                      text_color=R.T.text, hover_color=R.T.hover).pack(side="bottom", fill="x", padx=10, pady=(4, 10))
-        lst = ctk.CTkScrollableFrame(self, fg_color=R.T.field_bg, scrollbar_button_color=R.T.border,
-                                     scrollbar_button_hover_color=R.T.accent_hex)
-        lst.pack(fill="both", expand=True, padx=(4, 2))
-        if not games:
-            ctk.CTkLabel(lst, text=tr("gp.empty"), text_color=R.T.muted, font=ctk.CTkFont(size=12),
-                         wraplength=W - 80, justify="left").pack(anchor="w", padx=8, pady=8)
-        for name, nets in games.items():
-            ctk.CTkButton(lst, text=f"{name}   ·   {tr('gp.servers', n=len(nets))}", anchor="w", height=30,
-                          corner_radius=8, fg_color="transparent", hover_color=R.T.hover, text_color=R.T.text,
-                          command=lambda n=name, s=nets: self.pick(n, s)).pack(fill="x", padx=2)
-        self.place(x=14, y=60)
-        self.lift()
-
-    def pick(self, name: str, nets: list[str]) -> None:
-        self.destroy()
-        self.app.exclude_game(name, nets)
-
-
 def tray_icon(logo: str, state: str) -> Image.Image:
     """Значок в трее по состоянию: off — серый, on — цветной логотип, warn — с оранжевой точкой."""
     img = Image.open(ICONS / f"{logo}.png").convert("RGBA").resize((64, 64), Image.LANCZOS)
@@ -1065,6 +1040,25 @@ class Settings(ctk.CTkFrame):
         ctk.CTkLabel(body, text=tr("pdesc.auto"), text_color=R.T.muted, font=ctk.CTkFont(size=11),
                      wraplength=290, justify="left").pack(anchor="w", padx=14, pady=(4, 0))
 
+        # исключения: игра или сайт ломаются только с Lotus — две кнопки, по нажатию
+        # под ними появляется строка: выбрать игру из запущенных или вписать адрес сайта
+        section(tr("set.excl"))
+        ctk.CTkLabel(body, text=tr("set.excl_hint"), text_color=R.T.text_off, font=ctk.CTkFont(size=11),
+                     wraplength=290, justify="left").pack(anchor="w", padx=14, pady=(0, 6))
+        ex_row = ctk.CTkFrame(body, fg_color="transparent")
+        ex_row.pack(fill="x", padx=14)
+        ex_row.columnconfigure((0, 1), weight=1, uniform="col")
+        self.btn_game = button(ex_row, tr("set.excl_game"), lambda: self.reveal("game"))
+        self.btn_game.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.btn_site = button(ex_row, tr("set.excl_site_btn"), lambda: self.reveal("site"))
+        self.btn_site.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        # место под выезжающую строку; пустой tk.Frame занимает 1 пиксель, а не 200, как CTkFrame
+        self.slot = tk.Frame(body, height=1, bg=R.T.window_bg)
+        self.slot.pack(fill="x", padx=14)
+        self.mode: str | None = None
+        self.games: dict[str, tuple] = {}
+        self._button = button
+
         # инструменты
         section(tr("set.tools"))
         row = ctk.CTkFrame(body, fg_color="transparent")
@@ -1084,11 +1078,8 @@ class Settings(ctk.CTkFrame):
         button(body, tr("set.sites_save"),
                lambda: app.save_custom_sites(self.sites.get("1.0", "end"))).pack(fill="x", padx=14, pady=(6, 0))
 
-        # исключения: игры и сайты, которые обход не трогает
-        section(tr("set.excl"))
-        ctk.CTkLabel(body, text=tr("set.excl_hint"), text_color=R.T.text_off, font=ctk.CTkFont(size=11),
-                     wraplength=290, justify="left").pack(anchor="w", padx=14, pady=(0, 6))
-        button(body, tr("set.excl_game"), self.on_add_game).pack(fill="x", padx=14, pady=(0, 6))
+        # все исключения списком — поправить или удалить лишнее
+        section(tr("set.excl_list"))
         self.excl = ctk.CTkTextbox(body, height=90, corner_radius=10, fg_color=R.T.field_bg,
                                    text_color=R.T.text, border_width=1, border_color=R.T.border,
                                    font=ctk.CTkFont(family="Consolas", size=12))
@@ -1096,7 +1087,6 @@ class Settings(ctk.CTkFrame):
         self.excl.pack(fill="x", padx=14)
         button(body, tr("set.excl_save"),
                lambda: app.save_exclusions(self.excl.get("1.0", "end"))).pack(fill="x", padx=14, pady=(6, 0))
-        self.picker: GamePicker | None = None
 
         # переключатели
         self.watch = switch(tr("set.watch"), app.cfg.get("watchdog", True), self.on_watch)
@@ -1193,10 +1183,45 @@ class Settings(ctk.CTkFrame):
             a.log(tr("msg.ipset", n=n))
         a.run_bg(go)
 
-    def on_add_game(self) -> None:
-        """Найти программы с интернет-соединениями (это ~полсекунды) и показать выбор."""
-        if self.picker and self.picker.winfo_exists():
+    def reveal(self, mode: str) -> None:
+        """Показать под кнопками строку для игры или сайта; та же кнопка ещё раз — спрятать."""
+        for w in self.slot.winfo_children():
+            w.destroy()
+        self.slot.configure(height=1)
+        for b in (self.btn_game, self.btn_site):
+            b.configure(border_color=R.T.border)
+        if self.mode == mode:
+            self.mode = None
             return
+        self.mode = mode
+        (self.btn_game if mode == "game" else self.btn_site).configure(border_color=R.T.accent_hex)
+        row = ctk.CTkFrame(self.slot, fg_color="transparent")
+        row.pack(fill="x", pady=(6, 0))
+        add = self._button(row, tr("set.excl_add"), self.on_add_game if mode == "game" else self.on_add_site)
+        add.configure(width=96)
+        add.pack(side="right")
+        if mode == "site":
+            self.excl_site = ctk.CTkEntry(row, height=34, corner_radius=10, fg_color=R.T.field_bg,
+                                          border_width=1, border_color=R.T.accent_hex, text_color=R.T.text,
+                                          placeholder_text=tr("set.excl_site_ph"),
+                                          placeholder_text_color=R.T.text_off)
+            self.excl_site.pack(side="left", fill="x", expand=True, padx=(0, 6))
+            self.excl_site.bind("<Return>", lambda e: self.on_add_site())
+            self.after(50, self.excl_site.focus_set)
+            return
+        self.game_menu = ctk.CTkOptionMenu(row, values=[tr("gp.loading")], height=34, corner_radius=10,
+                                           fg_color=R.T.field_bg, button_color=R.T.border,
+                                           button_hover_color=R.T.accent_hex, text_color=R.T.text,
+                                           dropdown_fg_color=R.T.field_bg, dropdown_text_color=R.T.text,
+                                           dropdown_hover_color=R.T.border, dynamic_resizing=False)
+        self.game_menu.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.game_hint = ctk.CTkLabel(self.slot, text=tr("gp.hint"), text_color=R.T.text_off,
+                                      font=ctk.CTkFont(size=11), wraplength=290, justify="left")
+        self.game_hint.pack(anchor="w", pady=(4, 0))
+        self._load_games()
+
+    def _load_games(self) -> None:
+        """Список запущенных программ с соединениями — в фоне (netstat идёт ~полсекунды)."""
         a = self.app
 
         def go():
@@ -1204,13 +1229,35 @@ class Settings(ctk.CTkFrame):
                 games = engine.running_games()
             except Exception as e:
                 a.log(tr("msg.error", e=e))
-                return
-            a.post(lambda: self._show_picker(games))
+                games = {}
+            a.post(lambda: self._fill_games(games))
         threading.Thread(target=go, daemon=True).start()
 
-    def _show_picker(self, games: dict) -> None:
-        if self.winfo_exists():
-            self.picker = GamePicker(self, games)
+    def _fill_games(self, games: dict) -> None:
+        if self.mode != "game" or not self.game_menu.winfo_exists():
+            return
+        self.games = {f"{n}  ({len(v)})": (n, v) for n, v in games.items()}   # в скобках — сколько серверов
+        if self.games:
+            self.game_menu.configure(values=list(self.games))
+            self.game_menu.set(next(iter(self.games)))
+            self.game_hint.configure(text=tr("gp.hint"))
+        else:
+            self.game_menu.configure(values=[tr("gp.none")])
+            self.game_menu.set(tr("gp.none"))
+            self.game_hint.configure(text=tr("gp.empty"))
+
+    def on_add_game(self) -> None:
+        pick = self.games.get(self.game_menu.get())
+        if not pick:
+            self._load_games()   # игру запустили только что — поискать ещё раз
+            return
+        self.app.exclude_game(*pick)
+        self.reveal("game")      # спрятать строку
+
+    def on_add_site(self) -> None:
+        text = self.excl_site.get().strip()
+        if text and self.app.exclude_site(text):
+            self.excl_site.delete(0, "end")
 
     def on_tg(self) -> None:
         a = self.app
