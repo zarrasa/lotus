@@ -13,7 +13,7 @@ from tkinter import messagebox
 
 import customtkinter as ctk
 import pystray
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 import autostart
 import engine
@@ -110,6 +110,8 @@ class App(ctk.CTk):
         self.ui_q: queue.Queue = queue.Queue()  # задачи для окна из фоновых потоков
         self.watch_strikes = 0               # сколько проверок подряд что-то не открывалось
         self.updates: dict = {"lotus": None, "zapret": None}
+        self.popup: StrategyMenu | None = None   # меню стратегий у стрелочки ▼
+        self.tray_state = None               # (статус, тема) — какой значок сейчас в трее
 
         # --- холст и фон ---
         self.s = self._get_window_scaling()
@@ -129,7 +131,7 @@ class App(ctk.CTk):
         # --- статус и шестерёнка ---
         self.pill_text = self.text(PILL[0] + PILL[2] / 2, PILL[1] + PILL[3] / 2, "", 11, R.T.muted)
         self.gear = self.text(318, 29, "⚙", 17, R.T.text_off, tag="gear")
-        self.canvas.tag_bind("gear", "<Button-1>", lambda e: self.open_settings())
+        self.canvas.tag_bind("gear", "<ButtonRelease-1>", lambda e: self.open_settings())
         self.canvas.tag_bind("gear", "<Enter>", lambda e: self._hover_gear(True))
         self.canvas.tag_bind("gear", "<Leave>", lambda e: self._hover_gear(False))
 
@@ -141,6 +143,10 @@ class App(ctk.CTk):
         self.spin: dict[str, float] = {}      # когда у плитки побежал огонёк (сервис включается)
         self.hover_lvl = {sid: 0.0 for sid in TILES}
         self.hover: str | None = None
+        self.press_lvl = {sid: 0.0 for sid in TILES}   # плитка «вдавливается», пока зажата кнопка мыши
+        self.pressed: str | None = None
+        self.lift_px = {sid: 0 for sid in TILES}       # насколько сдвинуты надписи плитки (пиксели)
+        self.swallow = False                            # этот клик только закрыл меню
         self.was_on = {sid: self.tile_on(sid) for sid in TILES}
         for sid, (x, y, w, h) in TILES.items():
             if h < 80:
@@ -155,7 +161,9 @@ class App(ctk.CTk):
         x, y, w, h = TILES[PRESET_TILE]
         self.arrow = self.text(x + w - 14, y + 24, "", 12, R.T.text_off, anchor="e")
         # клики и наведение — по координатам: плитки нарисованы картинкой, а не виджетами
-        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Escape>", lambda e: self._on_escape())
         self.canvas.bind("<Motion>", lambda e: self._set_hover(self._hit(e)))
         self.canvas.bind("<Leave>", lambda e: self._set_hover(None))
 
@@ -237,15 +245,13 @@ class App(ctk.CTk):
         self._load_icons()
         self.layers.clear()
         self._scene_key = None
+        self.tray_state = None
         self.canvas.itemconfigure(self.title_item, fill=theme.text)
         self.canvas.itemconfigure(self.gear, fill=theme.text_off)
         self.canvas.itemconfigure(self.msg, fill=theme.muted)
         self.refresh()
         self._set_window_icon()
-        try:
-            self.tray.icon = Image.open(ICONS / f"{theme.logo}.png")
-        except Exception:
-            pass
+        self.close_popup()
         self._reopen_settings()
 
     def apply_lang(self, lang: str) -> None:
@@ -263,12 +269,10 @@ class App(ctk.CTk):
         self._reopen_settings()
 
     def _reopen_settings(self) -> None:
-        """Окно настроек проще пересоздать в новых цветах/языке на том же месте."""
+        """Панель настроек проще пересоздать в новых цветах/языке — сразу открытой, без выезда."""
         if self.settings and self.settings.winfo_exists():
-            pos = self.settings.geometry().split("+", 1)[1]
             self.settings.destroy()
-            self.settings = Settings(self)
-            self.settings.geometry(f"+{pos}")
+            self.settings = Settings(self, animate=False)
 
     # --- рисование ---
 
@@ -280,9 +284,12 @@ class App(ctk.CTk):
                                        anchor=anchor, tags=tag, **kw)
 
     def _layer(self, name: str, key: tuple, x: float, y: float, make) -> None:
-        """Обновить слой сцены, только если его вид поменялся."""
-        if self.layers.get(name, (None,))[0] != key:
+        """Обновить слой сцены, только если его вид поменялся (сдвиг картинку не перерисовывает)."""
+        old = self.layers.get(name)
+        if old is None or old[0] != key:
             self.layers[name] = (key, make(), x, y)
+        elif (old[2], old[3]) != (x, y):
+            self.layers[name] = (key, old[1], x, y)
 
     def tile_on(self, tid: str) -> bool:
         """Плитка включена, если включены все её сервисы."""
@@ -290,8 +297,17 @@ class App(ctk.CTk):
 
     def _draw_tile(self, sid: str, spin: int | None = None) -> None:
         on = self.tile_on(sid)
-        glow = round((self.glow[sid] + 0.2 * self.hover_lvl[sid]) * 50) / 50   # шаг 0.02
+        hov, prs = self.hover_lvl[sid], self.press_lvl[sid]
+        glow = round(max(0.0, self.glow[sid] + 0.25 * hov - 0.15 * prs) * 50) / 50   # шаг 0.02
         x, y, w, h = TILES[sid]
+        # при наведении плитка чуть приподнимается, при нажатии — «вдавливается»
+        dy = round((-2.0 * hov + 1.5 * prs) * self.s)
+        if dy != self.lift_px[sid]:
+            items = list(self.items[sid][1:]) + ([self.arrow] if sid == PRESET_TILE else [])
+            for it in items:
+                self.canvas.move(it, 0, dy - self.lift_px[sid])
+            self.lift_px[sid] = dy
+        y += dy / self.s
         icon = self.icons[sid] if on else self.icons_off[sid]
         key = ("spin", spin, on) if spin is not None else (glow, on)
         self._layer(sid, key, x, y, lambda: R.tile(
@@ -303,11 +319,9 @@ class App(ctk.CTk):
                     lambda: R.tile(w, h, self.s, 0.6 if running else 0.0, radius=12))
         self.canvas.itemconfigure(self.pill_text, text=tr("pill.on") if running else tr("pill.off"),
                                   fill=R.T.ok if running else R.T.muted)
-        if hasattr(self, "tray"):
-            self.tray.title = tr("tray.on") if running else tr("tray.off")
 
     def _render(self) -> None:
-        key = tuple((n, v[0]) for n, v in sorted(self.layers.items()))
+        key = tuple((n, v[0], v[2], v[3]) for n, v in sorted(self.layers.items()))
         if key == self._scene_key:
             return
         self._scene_key = key
@@ -321,8 +335,9 @@ class App(ctk.CTk):
     def _tick(self) -> None:
         """Кадр анимации: огонёк бегает по рамке, пока сервис включается; когда запустился —
         рамка разгорается целиком; при выключении плавно гаснет."""
-        if self.state() == "withdrawn":  # окно в трее — рисовать незачем
-            self.after(200, self._tick)
+        # окно в трее или его целиком закрыла панель настроек — рисовать незачем
+        if self.state() == "withdrawn" or (self.settings and self.settings.covers()):
+            self.after(100, self._tick)
             return
         started = time.perf_counter()
         pending = (tr("st.starting"), tr("st.checking"))
@@ -330,6 +345,11 @@ class App(ctk.CTk):
             on = self.tile_on(sid)
             target = 1.0 if self.hover == sid else 0.0
             self.hover_lvl[sid] += (target - self.hover_lvl[sid]) * 0.25
+            target = 1.0 if self.pressed == sid and self.hover == sid else 0.0
+            self.press_lvl[sid] += (target - self.press_lvl[sid]) * 0.45
+            for lvl in (self.hover_lvl, self.press_lvl):   # хвосты анимации — сразу в ноль/единицу
+                if abs(lvl[sid] - round(lvl[sid])) < 0.01:
+                    lvl[sid] = float(round(lvl[sid]))
 
             if on and self.canvas.itemcget(self.items[sid][2], "text") in pending:
                 # положение огонька — по времени, а не по кадрам: скорость не зависит от FPS
@@ -364,26 +384,40 @@ class App(ctk.CTk):
         tx, ty, w, h = TILES[PRESET_TILE]
         return tx + w - ARROW_ZONE <= x <= tx + w and ty <= y <= ty + 44
 
-    def _on_click(self, e) -> None:
-        if self._on_arrow(e):
-            self.preset_menu(e.x_root, e.y_root)
-        elif k := self._hit(e):
-            self.on_tile(k)
+    def _on_press(self, e) -> None:
+        # клик мимо открытого меню стратегий только закрывает его
+        self.swallow = self.popup is not None
+        if self.swallow:
+            self.close_popup()
+            return
+        self.pressed = self._hit(e)
 
-    def preset_menu(self, x: int, y: int) -> None:
-        """Стратегии Flowseal для YouTube и Discord (general, ALT, ALT2…) и автоподбор."""
-        cur = self.strategy()
-        menu = tk.Menu(self, tearoff=0, bg=R.T.field_bg, fg=R.T.text, activebackground=R.T.accent_hex,
-                       activeforeground="#FFFFFF", bd=0, font=("Segoe UI", 10))
-        for name in engine.strategy_names():
-            mark = "✓  " if name == cur else "     "
-            menu.add_command(label=mark + name, command=lambda n=name: self.set_strategy(n))
-        menu.add_separator()
-        menu.add_command(label="     " + tr("set.auto"), command=lambda: self.run_bg(self.run_autodetect))
-        try:
-            menu.tk_popup(x, y)
-        finally:
-            menu.grab_release()
+    def _on_release(self, e) -> None:
+        tid, self.pressed = self.pressed, None
+        if self.swallow or tid is None or self._hit(e) != tid:
+            return   # отпустили не на той плитке — передумал
+        if tid == PRESET_TILE and self._on_arrow(e):
+            self.preset_menu()
+        else:
+            self.on_tile(tid)
+
+    def _on_escape(self) -> None:
+        if self.popup:
+            self.close_popup()
+        elif self.settings and self.settings.winfo_exists():
+            self.close_settings()
+
+    def preset_menu(self) -> None:
+        """Стеклянное меню стратегий Flowseal для YouTube и Discord (general, ALT, ALT2…) и автоподбор."""
+        if self.popup:
+            self.close_popup()
+            return
+        self.popup = StrategyMenu(self)
+
+    def close_popup(self) -> None:
+        if self.popup:
+            self.popup.destroy()
+            self.popup = None
 
     def strategy(self) -> str:
         """Стратегия Flowseal у плитки YouTube + Discord (по умолчанию — general)."""
@@ -554,7 +588,7 @@ class App(ctk.CTk):
 
     def refresh(self) -> None:
         running = self.engine.running
-        sel = self.selected()
+        warn = False   # хоть одна плитка красная — в трее значок с оранжевой точкой
         for sid in TILES:
             on = self.tile_on(sid)
             svcs = tile_services(sid)
@@ -583,6 +617,7 @@ class App(ctk.CTk):
             _, nm, st = self.items[sid]
             self.canvas.itemconfigure(st, text=text, fill=color)
             self.canvas.itemconfigure(nm, fill=R.T.text if on else R.T.text_off)
+            warn = warn or color == R.T.err
             if on != self.was_on[sid]:
                 self.was_on[sid] = on
                 if not on:
@@ -592,6 +627,14 @@ class App(ctk.CTk):
                                   fill=R.T.text if self.tile_on(PRESET_TILE) else R.T.text_off)
         self._draw_pill(running)
         if hasattr(self, "tray"):
+            state = "warn" if warn else "on" if running else "off"
+            if self.tray_state != (state, R.T.id):
+                self.tray_state = (state, R.T.id)
+                try:
+                    self.tray.icon = tray_icon(R.T.logo, state)
+                except Exception:
+                    pass
+            self.tray.title = tr(f"tray.{state}")
             self.tray.update_menu()
 
     # --- сторож: сам замечает, что сервис перестал открываться, и подбирает пресет ---
@@ -762,14 +805,23 @@ class App(ctk.CTk):
         self.refresh()
 
     def open_settings(self) -> None:
+        """Настройки выезжают панелью справа поверх плиток; ⚙ ещё раз, «←» или Esc — закрыть."""
+        self.close_popup()
         if self.settings and self.settings.winfo_exists():
-            self.settings.focus()
+            self.close_settings()
             return
         self.settings = Settings(self)
 
+    def close_settings(self) -> None:
+        panel, self.settings = self.settings, None
+        if panel and panel.winfo_exists():
+            panel.slide(W, done=panel.destroy)
+
     def hide_to_tray(self) -> None:
+        self.close_popup()
         if self.settings and self.settings.winfo_exists():
             self.settings.destroy()
+            self.settings = None
         self.withdraw()
         if not self.tray_hint_shown:
             self.tray_hint_shown = True
@@ -805,16 +857,112 @@ class App(ctk.CTk):
         self.destroy()
 
 
-class Settings(ctk.CTkToplevel):
+def strategy_group(name: str) -> str:
+    """К какой группе в меню относится стратегия Flowseal."""
+    if "FAKE TLS" in name:
+        return "sg.fake_tls"
+    if "SIMPLE FAKE" in name:
+        return "sg.simple"
+    if "EXP" in name:
+        return "sg.exp"
+    return "sg.main"
+
+
+def strategy_label(name: str) -> str:
+    """«general (ALT3)» -> «ALT3»: группа и так подписана, лишнее слово только мешает читать."""
+    m = re.fullmatch(r"general \((.+)\)", name)
+    return m.group(1) if m else name
+
+
+class StrategyMenu(ctk.CTkFrame):
+    """Выпадающее меню стратегий в стиле Lotus: стекло в цветах темы, сверху вниз по группам."""
+    MW, MH = 236, 372
+
     def __init__(self, app: App) -> None:
-        super().__init__(app, fg_color=R.T.window_bg)
+        super().__init__(app, width=self.MW, height=40, corner_radius=14, fg_color=R.T.field_bg,
+                         border_width=1, border_color=R.T.accent_hex, bg_color=R.T.window_bg)
         self.app = app
-        self.title(tr("set.title"))
-        self.geometry(f"{W}x600")
-        self.resizable(False, False)
-        self.transient(app)
-        self.after(150, self.lift)
-        self.after(250, lambda: self.iconbitmap(str(ICONS / f"{R.T.logo}.ico")))
+        self.pack_propagate(False)
+        ctk.CTkLabel(self, text=tr("sm.title"), text_color=R.T.text,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=14, pady=(10, 0))
+        auto = ctk.CTkButton(self, text="✦  " + tr("set.auto"), command=self.on_auto, height=32,
+                             corner_radius=10, fg_color=R.T.window_bg, border_width=1,
+                             border_color=R.T.border, text_color=R.T.text, hover_color=R.T.hover)
+        auto.pack(side="bottom", fill="x", padx=10, pady=(4, 10))
+        lst = ctk.CTkScrollableFrame(self, fg_color=R.T.field_bg, scrollbar_button_color=R.T.border,
+                                     scrollbar_button_hover_color=R.T.accent_hex)
+        lst.pack(fill="both", expand=True, padx=(4, 2), pady=(2, 0))
+        self.lst = lst
+
+        cur, group, rows, cur_row = app.strategy(), None, 0, 0
+        for name in engine.strategy_names():
+            g = strategy_group(name)
+            if g != group:
+                group = g
+                ctk.CTkLabel(lst, text=tr(g), text_color=R.T.muted, anchor="w",
+                             font=ctk.CTkFont(size=11)).pack(fill="x", padx=8, pady=(8 if rows else 2, 0))
+                rows += 1
+            on = name == cur
+            if on:
+                cur_row = rows
+            ctk.CTkButton(lst, text=("✓   " if on else "      ") + strategy_label(name), anchor="w",
+                          height=28, corner_radius=8, command=lambda n=name: self.pick(n),
+                          fg_color=R.T.hover if on else "transparent", hover_color=R.T.hover,
+                          text_color="#%02X%02X%02X" % R.T.accent_light if on else R.T.text,
+                          font=ctk.CTkFont(size=13, weight="bold" if on else "normal")).pack(fill="x", padx=2)
+            rows += 1
+
+        x, y, w, h = TILES[PRESET_TILE]
+        self.place(x=x + w - self.MW, y=y + 38)
+        self.lift()
+        # текущая стратегия — сразу на виду, а не где-то внизу списка
+        self.after(30, lambda: lst._parent_canvas.yview_moveto(max(0.0, (cur_row - 3) / max(rows, 1))))
+        self._grow(1)
+
+    def _grow(self, i: int, n: int = 9) -> None:
+        """Меню раскрывается вниз за ~0.15 с."""
+        if not self.winfo_exists():
+            return
+        self.configure(height=round(40 + (self.MH - 40) * _ease_out(i / n)))
+        if i < n:
+            self.after(FRAME_MS, lambda: self._grow(i + 1, n))
+
+    def pick(self, name: str) -> None:
+        self.app.close_popup()
+        self.app.set_strategy(name)
+
+    def on_auto(self) -> None:
+        self.app.close_popup()
+        self.app.run_bg(self.app.run_autodetect)
+
+
+def tray_icon(logo: str, state: str) -> Image.Image:
+    """Значок в трее по состоянию: off — серый, on — цветной логотип, warn — с оранжевой точкой."""
+    img = Image.open(ICONS / f"{logo}.png").convert("RGBA").resize((64, 64), Image.LANCZOS)
+    if state == "off":
+        grey = ImageOps.grayscale(img).convert("RGBA")
+        grey.putalpha(img.getchannel("A").point(lambda a: int(a * 0.8)))
+        return grey
+    if state == "warn":
+        d = ImageDraw.Draw(img)
+        d.ellipse((34, 34, 63, 63), fill=(18, 18, 24, 255))
+        d.ellipse((39, 39, 58, 58), fill=(255, 159, 28, 255))
+    return img
+
+
+class Settings(ctk.CTkFrame):
+    """Настройки — панель, которая выезжает справа внутри окна Lotus."""
+
+    def __init__(self, app: App, animate: bool = True) -> None:
+        super().__init__(app, fg_color=R.T.window_bg, corner_radius=0)
+        self.app = app
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.pack(fill="x", padx=12, pady=(12, 0))
+        ctk.CTkButton(head, text="←", width=34, height=32, corner_radius=10, command=app.close_settings,
+                      fg_color=R.T.field_bg, border_width=1, border_color=R.T.border, text_color=R.T.text,
+                      hover_color=R.T.hover, font=ctk.CTkFont(size=16)).pack(side="left")
+        ctk.CTkLabel(head, text=tr("set.title"), text_color=R.T.text,
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(side="left", padx=10)
 
         body = ctk.CTkScrollableFrame(self, fg_color=R.T.window_bg,
                                       scrollbar_button_color=R.T.border,
@@ -822,8 +970,8 @@ class Settings(ctk.CTkToplevel):
         body.pack(fill="both", expand=True, padx=(4, 0), pady=(4, 8))
 
         def section(text):
-            ctk.CTkLabel(body, text=text, text_color=R.T.muted,
-                         font=ctk.CTkFont(size=12)).pack(anchor="w", padx=14, pady=(14, 4))
+            ctk.CTkLabel(body, text=text, text_color=R.T.muted, font=ctk.CTkFont(size=12),
+                         wraplength=290, justify="left").pack(anchor="w", padx=14, pady=(14, 4))
 
         def button(master, text, cmd):
             return ctk.CTkButton(master, text=text, command=cmd, height=34, corner_radius=10,
@@ -930,6 +1078,31 @@ class Settings(ctk.CTkToplevel):
         self.logbox.pack(fill="x", padx=14, pady=(0, 8))
         for line in app.log_lines[-50:]:
             self.append_log(line)
+
+        self.x = W if animate else 0
+        self.place(x=self.x, y=0, relwidth=1, relheight=1)
+        self.lift()
+        if animate:
+            self.slide(0)
+
+    def covers(self) -> bool:
+        """Панель открыта целиком — плитки под ней не видны."""
+        return self.winfo_exists() and self.x == 0
+
+    def slide(self, target: int, done=None, n: int = 12) -> None:
+        """Выезд/уезд панели за ~0.2 с с плавным замедлением."""
+        start = self.x
+
+        def step(i: int) -> None:
+            if not self.winfo_exists():
+                return
+            self.x = round(start + (target - start) * _ease_out(i / n))
+            self.place(x=self.x, y=0, relwidth=1, relheight=1)
+            if i < n:
+                self.after(FRAME_MS, lambda: step(i + 1))
+            elif done:
+                done()
+        step(1)
 
     def sync_switches(self) -> None:
         self.autostart.select() if self.app.autostart_on else self.autostart.deselect()
