@@ -143,9 +143,7 @@ class App(ctk.CTk):
         self.spin: dict[str, float] = {}      # когда у плитки побежал огонёк (сервис включается)
         self.hover_lvl = {sid: 0.0 for sid in TILES}
         self.hover: str | None = None
-        self.press_lvl = {sid: 0.0 for sid in TILES}   # плитка «вдавливается», пока зажата кнопка мыши
-        self.pressed: str | None = None
-        self.lift_px = {sid: 0 for sid in TILES}       # насколько сдвинуты надписи плитки (пиксели)
+        self.pressed: str | None = None                # на какой плитке нажали кнопку мыши
         self.swallow = False                            # этот клик только закрыл меню
         self.was_on = {sid: self.tile_on(sid) for sid in TILES}
         for sid, (x, y, w, h) in TILES.items():
@@ -272,7 +270,7 @@ class App(ctk.CTk):
         """Панель настроек проще пересоздать в новых цветах/языке — сразу открытой, без выезда."""
         if self.settings and self.settings.winfo_exists():
             self.settings.destroy()
-            self.settings = Settings(self, animate=False)
+            self.settings = Settings(self)
 
     # --- рисование ---
 
@@ -297,17 +295,8 @@ class App(ctk.CTk):
 
     def _draw_tile(self, sid: str, spin: int | None = None) -> None:
         on = self.tile_on(sid)
-        hov, prs = self.hover_lvl[sid], self.press_lvl[sid]
-        glow = round(max(0.0, self.glow[sid] + 0.25 * hov - 0.15 * prs) * 50) / 50   # шаг 0.02
+        glow = round((self.glow[sid] + 0.2 * self.hover_lvl[sid]) * 50) / 50   # шаг 0.02
         x, y, w, h = TILES[sid]
-        # при наведении плитка чуть приподнимается, при нажатии — «вдавливается»
-        dy = round((-2.0 * hov + 1.5 * prs) * self.s)
-        if dy != self.lift_px[sid]:
-            items = list(self.items[sid][1:]) + ([self.arrow] if sid == PRESET_TILE else [])
-            for it in items:
-                self.canvas.move(it, 0, dy - self.lift_px[sid])
-            self.lift_px[sid] = dy
-        y += dy / self.s
         icon = self.icons[sid] if on else self.icons_off[sid]
         key = ("spin", spin, on) if spin is not None else (glow, on)
         self._layer(sid, key, x, y, lambda: R.tile(
@@ -345,11 +334,8 @@ class App(ctk.CTk):
             on = self.tile_on(sid)
             target = 1.0 if self.hover == sid else 0.0
             self.hover_lvl[sid] += (target - self.hover_lvl[sid]) * 0.25
-            target = 1.0 if self.pressed == sid and self.hover == sid else 0.0
-            self.press_lvl[sid] += (target - self.press_lvl[sid]) * 0.45
-            for lvl in (self.hover_lvl, self.press_lvl):   # хвосты анимации — сразу в ноль/единицу
-                if abs(lvl[sid] - round(lvl[sid])) < 0.01:
-                    lvl[sid] = float(round(lvl[sid]))
+            if abs(self.hover_lvl[sid] - target) < 0.01:   # хвост анимации — сразу в ноль/единицу
+                self.hover_lvl[sid] = target
 
             if on and self.canvas.itemcget(self.items[sid][2], "text") in pending:
                 # положение огонька — по времени, а не по кадрам: скорость не зависит от FPS
@@ -805,7 +791,7 @@ class App(ctk.CTk):
         self.refresh()
 
     def open_settings(self) -> None:
-        """Настройки выезжают панелью справа поверх плиток; ⚙ ещё раз, «←» или Esc — закрыть."""
+        """Настройки открываются панелью поверх плиток; «←» или Esc — закрыть."""
         self.close_popup()
         if self.settings and self.settings.winfo_exists():
             self.close_settings()
@@ -815,7 +801,7 @@ class App(ctk.CTk):
     def close_settings(self) -> None:
         panel, self.settings = self.settings, None
         if panel and panel.winfo_exists():
-            panel.slide(W, done=panel.destroy)
+            panel.destroy()
 
     def hide_to_tray(self) -> None:
         self.close_popup()
@@ -879,7 +865,7 @@ class StrategyMenu(ctk.CTkFrame):
     MW, MH = 236, 372
 
     def __init__(self, app: App) -> None:
-        super().__init__(app, width=self.MW, height=40, corner_radius=14, fg_color=R.T.field_bg,
+        super().__init__(app, width=self.MW, height=self.MH, corner_radius=14, fg_color=R.T.field_bg,
                          border_width=1, border_color=R.T.accent_hex, bg_color=R.T.window_bg)
         self.app = app
         self.pack_propagate(False)
@@ -912,20 +898,14 @@ class StrategyMenu(ctk.CTkFrame):
                           font=ctk.CTkFont(size=13, weight="bold" if on else "normal")).pack(fill="x", padx=2)
             rows += 1
 
+        # меню собирается за краем окна и появляется сразу целиком, уже прокрученное
+        # к текущей стратегии, — без мигания недорисованных строк
         x, y, w, h = TILES[PRESET_TILE]
+        self.place(x=W + 10, y=y + 38)
+        self.update_idletasks()
+        lst._parent_canvas.yview_moveto(max(0.0, (cur_row - 3) / max(rows, 1)))
         self.place(x=x + w - self.MW, y=y + 38)
         self.lift()
-        # текущая стратегия — сразу на виду, а не где-то внизу списка
-        self.after(30, lambda: lst._parent_canvas.yview_moveto(max(0.0, (cur_row - 3) / max(rows, 1))))
-        self._grow(1)
-
-    def _grow(self, i: int, n: int = 9) -> None:
-        """Меню раскрывается вниз за ~0.15 с."""
-        if not self.winfo_exists():
-            return
-        self.configure(height=round(40 + (self.MH - 40) * _ease_out(i / n)))
-        if i < n:
-            self.after(FRAME_MS, lambda: self._grow(i + 1, n))
 
     def pick(self, name: str) -> None:
         self.app.close_popup()
@@ -953,7 +933,7 @@ def tray_icon(logo: str, state: str) -> Image.Image:
 class Settings(ctk.CTkFrame):
     """Настройки — панель, которая выезжает справа внутри окна Lotus."""
 
-    def __init__(self, app: App, animate: bool = True) -> None:
+    def __init__(self, app: App) -> None:
         super().__init__(app, fg_color=R.T.window_bg, corner_radius=0)
         self.app = app
         head = ctk.CTkFrame(self, fg_color="transparent")
@@ -1079,30 +1059,16 @@ class Settings(ctk.CTkFrame):
         for line in app.log_lines[-50:]:
             self.append_log(line)
 
-        self.x = W if animate else 0
-        self.place(x=self.x, y=0, relwidth=1, relheight=1)
+        # панель собирается за краем окна и появляется сразу целиком: двигать по кадрам
+        # много виджетов tkinter не успевает — выезд получался дёрганым
+        self.place(x=W, y=0, relwidth=1, relheight=1)
+        self.update_idletasks()
+        self.place(x=0, y=0, relwidth=1, relheight=1)
         self.lift()
-        if animate:
-            self.slide(0)
 
     def covers(self) -> bool:
-        """Панель открыта целиком — плитки под ней не видны."""
-        return self.winfo_exists() and self.x == 0
-
-    def slide(self, target: int, done=None, n: int = 12) -> None:
-        """Выезд/уезд панели за ~0.2 с с плавным замедлением."""
-        start = self.x
-
-        def step(i: int) -> None:
-            if not self.winfo_exists():
-                return
-            self.x = round(start + (target - start) * _ease_out(i / n))
-            self.place(x=self.x, y=0, relwidth=1, relheight=1)
-            if i < n:
-                self.after(FRAME_MS, lambda: step(i + 1))
-            elif done:
-                done()
-        step(1)
+        """Панель открыта — плитки под ней не видны."""
+        return self.winfo_exists()
 
     def sync_switches(self) -> None:
         self.autostart.select() if self.app.autostart_on else self.autostart.deselect()
